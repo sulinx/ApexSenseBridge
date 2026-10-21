@@ -50,6 +50,12 @@ public:
 private:
     void apply(TriggerSide side, std::uint8_t enableBits,
                const std::array<std::uint8_t, 11>& effect);
+    // LOCAL PATCH: the Vader has no resistance actuator. Translate a DualSense
+    // trigger effect into the trigger motor so the player still gets per-effect
+    // feedback (weaker in character than resistance, but distinguishable)
+    // instead of aborting the session.
+    void applyVaderTriggerVibration(
+        TriggerSide side, const std::array<std::uint8_t, 11>& effect);
     void recordBlock(TriggerSide side, std::uint8_t enableBits,
                      const std::array<std::uint8_t, 11>& effect);
     bool send(const ForceTriggerCommand& command, std::uint8_t dualSenseType);
@@ -61,6 +67,9 @@ private:
     };
     std::array<std::optional<ArmedBow>, 2> armedBow_;
     std::atomic_bool bowArmed_{false};
+    // LOCAL PATCH: per-side trigger-motor amplitude used when a DualSense
+    // trigger effect is rendered as vibration on the Vader.
+    std::array<std::uint8_t, 2> vaderTriggerLane_{};
 
     flydigi::Apex5Device& device_;
     unsigned strengthPercent_ = 100;

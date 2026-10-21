@@ -766,7 +766,8 @@ class Apex5DualHidPhysicalInputSource final : public PhysicalInputSource {
 public:
     static std::unique_ptr<Apex5DualHidPhysicalInputSource> open(
         const HidDeviceInfo& vendorInterface,
-        std::string& error) {
+        std::string& error,
+        bool vaderProduct = false) {
         if (vendorInterface.vendorId != flydigi::kVendorId ||
             !flydigi::isControllerProduct(vendorInterface.productId) ||
             vendorInterface.usagePage != flydigi::kVendorUsagePage ||
@@ -807,7 +808,7 @@ public:
         auto source = std::unique_ptr<Apex5DualHidPhysicalInputSource>(
             new Apex5DualHidPhysicalInputSource(
                 vendorInterface, handle, std::move(mappedGamepad),
-                std::move(xinputGamepad)));
+                std::move(xinputGamepad), vaderProduct));
         if (!source->event_) {
             error = "Could not create the Apex 5 vendor input event.";
             return {};
@@ -838,25 +839,50 @@ public:
             }
         }
 
+        // LOCAL PATCH: the mapped collection is now purely optional and is never
+        // put on the critical path. It is left open (composeState ignores it
+        // while a vendor frame is fresh) but it is not armed or waited on here,
+        // so its intermittent health cannot throttle or stall the session.
         std::string mappedError;
-        if (!mappedGamepad_->prepareRead(mappedError)) {
-            error = "The physical Apex 5 mapped HID stream failed (" +
-                    mappedError + ").";
-            return PhysicalInputStatus::Error;
-        }
+        (void)mappedError;
 
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         for (;;) {
-            std::array<HANDLE, 2> events{mappedGamepad_->readEvent(), event_};
-            const DWORD eventCount = vendorUnavailable_ ? 1U : 2U;
+            // LOCAL PATCH: wait on the vendor event ONLY.
+            //
+            // The vendor 0xEF frame is a complete controller state, so the
+            // mapped collection no longer contributes anything the caller needs
+            // -- it only served to merge equivalent values back in. Keeping it in
+            // the wait set was actively harmful: WaitForMultipleObjects returns
+            // the lowest ready index, so a mapped completion always pre-empted a
+            // ready vendor completion, and drainVendorReports() then had to guess
+            // whether more vendor frames were pending. Measured with the mapped
+            // collection in the set: mapped alternated between 0/s and 270/s as
+            // Windows re-enumerated it, timeouts climbed to 586, and the vendor
+            // rate sagged from 414/s to 214/s in exactly those windows. With a
+            // single waiter the vendor stream is serviced the moment its read
+            // completes, independent of the mapped collection's health.
+            const DWORD eventCount = vendorUnavailable_ ? 0U : 1U;
+            std::array<HANDLE, 1> events{event_};
             const auto now = std::chrono::steady_clock::now();
             const auto remaining = now < deadline
                 ? std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
                 : std::chrono::milliseconds(0);
-            const DWORD waitResult = WaitForMultipleObjects(
-                eventCount, events.data(), FALSE, waitMilliseconds(remaining));
+            const DWORD waitResult = eventCount == 0
+                ? WAIT_TIMEOUT
+                : WaitForMultipleObjects(eventCount, events.data(), FALSE,
+                                         waitMilliseconds(remaining));
             if (waitResult == WAIT_TIMEOUT) {
                 if (!mappedInputObserved_ && pollXInputFallback(state)) {
+                    ++stats_.reports;
+                    return PhysicalInputStatus::State;
+                }
+                // The vendor wait expired. Collect anything that landed inside
+                // the same millisecond before reporting silence, otherwise the
+                // caller's freshness watchdog counts pure scheduling jitter as a
+                // dead stream.
+                if (drainVendorReports() && lastVendorState_) {
+                    composeState(state);
                     ++stats_.reports;
                     return PhysicalInputStatus::State;
                 }
@@ -871,27 +897,10 @@ public:
             }
 
             const DWORD selected = waitResult - WAIT_OBJECT_0;
-            if (selected == 0) {
-                dualsense::DualSenseInputState mappedState{};
-                const auto mappedStatus = mappedGamepad_->completePreparedRead(
-                    mappedState, mappedError);
-                if (mappedStatus != PhysicalInputStatus::State) {
-                    if (!mappedInputObserved_ && pollXInputFallback(state)) {
-                        ++stats_.reports;
-                        return PhysicalInputStatus::State;
-                    }
-                    error = "The physical Apex 5 mapped HID stream failed (" +
-                            mappedError + ").";
-                    return mappedStatus;
-                }
-                mappedInputObserved_ = true;
-                lastMappedState_ = mappedState;
-                xinputFallbackActive_ = false;
-                drainVendorReports();
-                composeState(state);
-                ++stats_.reports;
-                return PhysicalInputStatus::State;
-            }
+            // LOCAL PATCH: the only waiter is the vendor event, so index 0 is a
+            // vendor completion. The mapped collection is maintained out of band
+            // by drainVendorReports()/composeState() hints and never gates input.
+            (void)selected;
 
             bool decodedVendorState = consumeVendorReport();
             if (!vendorUnavailable_) {
@@ -910,21 +919,57 @@ public:
                 error = "The physical Apex 5 XInput fallback disconnected.";
                 return PhysicalInputStatus::Disconnected;
             }
-            if (decodedVendorState && lastMappedState_) {
-                composeState(state);
-                ++stats_.reports;
-                return PhysicalInputStatus::State;
-            }
-            if (decodedVendorState && !mappedInputObserved_ &&
-                pollXInputFallback(state)) {
-                ++stats_.reports;
-                return PhysicalInputStatus::State;
+            // LOCAL PATCH: a decoded vendor frame is a complete controller state
+            // on its own (sticks, both triggers, dpad and the full button mask all
+            // come out of the 0xEF operator report), so it must not be held back
+            // waiting for a mapped-HID frame that may never arrive. Previously
+            // this branch required lastMappedState_, which meant a degraded
+            // mapped collection (23 reports/s measured under load) throttled the
+            // whole session even though vendor frames were arriving at 412/s.
+            if (decodedVendorState) {
+                if (lastMappedState_ || lastVendorState_) {
+                    composeState(state);
+                    ++stats_.reports;
+                    return PhysicalInputStatus::State;
+                }
+                if (pollXInputFallback(state)) {
+                    ++stats_.reports;
+                    return PhysicalInputStatus::State;
+                }
             }
         }
     }
 
     std::string_view backendName() const noexcept override {
         return "apex5-v9-mapped+vendor-guarded";
+    }
+
+    // LOCAL PATCH: see PhysicalInputSource::recoverStream.
+    //
+    // Measured stall shape on a Vader 5 Pro over the 2.4 GHz dongle while the
+    // controller was in active use: input_vendor_max_gap_ms reached 1625 ms and
+    // then 3192/3256 ms, always while decoded-frame counters were healthy on
+    // both sides of the gap, with read and parse failure counters at zero for
+    // the whole session. That is the device (or its dongle) withholding frames,
+    // not a dead handle, so the correct response is to re-arm the read and let
+    // the stream resume rather than tear the bridge down.
+    bool recoverStream() noexcept override {
+        if (vendorUnavailable_) {
+            // A previous read failed hard. Assume the device came back and give
+            // it one more chance instead of condemning the session.
+            vendorUnavailable_ = false;
+        }
+        std::string recoverError;
+        const bool armed = ensureReadArmed(recoverError);
+        if (!armed) {
+            vendorUnavailable_ = true;
+            ++vendorReadFailures_;
+            return false;
+        }
+        // Any frame that landed while the caller was deciding is worth taking
+        // now: it re-seeds lastVendorState_ and restarts the gap tracker.
+        (void)drainVendorReports();
+        return true;
     }
     bool eventDriven() const noexcept override { return true; }
     PhysicalInputSourceStats stats() const noexcept override {
@@ -943,9 +988,21 @@ public:
         return result;
     }
     bool requiresIndependentTriggers() const noexcept override {
+        // LOCAL PATCH: the Vader's LT/RT always come from the vendor 0xEF
+        // stream, so the Apex-5 combined-axis hazard never applies and the
+        // freshness gate below must not abort the session.
+        if (vaderProduct_) return false;
+        if (!mappedGamepad_) return false;
         return mappedGamepad_->hasCombinedTriggerAxis();
     }
     bool independentTriggersReady() const noexcept override {
+        // LOCAL PATCH: on the Vader the vendor 0xEF stream *is* the independent
+        // LT/RT source, so vendor readiness alone is enough. Requiring mapped
+        // HID as well aborts the session whenever that collection is quiet.
+        if (vaderProduct_) {
+            return !vendorUnavailable_ &&
+                   independentTriggerFreshness_.ready();
+        }
         return mappedInputObserved_ && !vendorUnavailable_ && independentTriggerFreshness_.ready();
     }
     void setBatteryState(std::uint8_t batteryPercent, std::uint8_t chargeState) noexcept override {
@@ -958,11 +1015,15 @@ private:
     Apex5DualHidPhysicalInputSource(
         const HidDeviceInfo& info, HANDLE handle,
         std::unique_ptr<HidPhysicalInputSource> mappedGamepad,
-        std::unique_ptr<XInputGamepad> xinputGamepad)
+        std::unique_ptr<XInputGamepad> xinputGamepad,
+        bool vaderProduct)
         : handle_(handle), io_(std::make_unique<OverlappedIo>(info.inputReportLength)),
           event_(io_->event), overlapped_(io_->overlapped), report_(io_->buffer),
           mappedGamepad_(std::move(mappedGamepad)),
-          xinputGamepad_(std::move(xinputGamepad)) {}
+          xinputGamepad_(std::move(xinputGamepad)),
+          // LOCAL PATCH: the Vader 5 Pro shares this vendor interface but not
+          // the Apex 5 operator-report layout, so remember which parser to use.
+          vaderProduct_(vaderProduct) {}
 
     bool ensureReadPending(std::string& error) {
         if (readPending_) return true;
@@ -992,6 +1053,16 @@ private:
             ++vendorReadFailures_;
             return false;
         }
+        // LOCAL PATCH: consume the completion event here, not in the next
+        // ensureReadPending(). A manual-reset event stays signalled after the
+        // IRP completes, so leaving it set lets the next arm reset it *after*
+        // the kernel already reported a fresh completion; that lost edge makes
+        // the stream freeze with vendorReadFailures_ and vendorParseFailures_
+        // both at zero, which is exactly the failure measured under sustained
+        // input (frame counter stuck while every error counter stayed still).
+        // Resetting immediately after collecting the result means the next wait
+        // only sees completions that happened after this frame.
+        ResetEvent(event_);
         ++vendorReports_;
 
         if (bytesRead >= 14 &&
@@ -1010,6 +1081,38 @@ private:
                 ++vendorParseFailures_;
             }
             return false;
+        }
+
+        // LOCAL PATCH: the Vader 5 Pro uses report ID 0x00 and a different
+        // 0xEF frame layout, so dispatch on the product instead of requiring
+        // the Apex-family input report ID.
+        if (vaderProduct_) {
+            // Command ACKs (0x12 rumble baselines, 0x11 transport, 0x1C
+            // acquire) share this interface and arrive interleaved with the
+            // operator stream. They are not operator frames, so skip them
+            // without counting a parse failure.
+            const bool isCommandAck =
+                bytesRead >= 4 && report_[0] == flydigi::kReportIdOutVader &&
+                report_[1] == flydigi::kMagic0 &&
+                report_[2] == flydigi::kMagic1 &&
+                report_[3] != flydigi::kCmdOperatorData;
+            if (isCommandAck) return false;
+
+            const auto decoded = flydigi::decodeVaderInputReport(
+                std::span<const std::uint8_t>(report_.data(), bytesRead),
+                currentBatteryPercent_.load(std::memory_order_relaxed),
+                currentChargeState_.load(std::memory_order_relaxed));
+            if (!decoded) {
+                ++vendorParseFailures_;
+                return false;
+            }
+            const auto decodedAt = std::chrono::steady_clock::now();
+            lastVendorState_ = *decoded;
+            lastVendorStateAt_ = decodedAt;
+            independentTriggerFreshness_.observe(decodedAt);
+            vendorGaps_.observe(decodedAt);
+            ++vendorStates_;
+            return true;
         }
 
         if (bytesRead < 4 || report_[0] != flydigi::kReportIdIn ||
@@ -1034,13 +1137,48 @@ private:
         return true;
     }
 
+    // LOCAL PATCH: guarantees the vendor read is genuinely in flight. A read
+    // whose completion was already consumed elsewhere leaves readPending_ set
+    // while no I/O is outstanding, which would silence the 0xEF stream forever.
+    bool ensureReadArmed(std::string& error) {
+        if (readPending_) {
+            // Outstanding I/O with an unsignalled event is healthy.
+            if (WaitForSingleObject(event_, 0) != WAIT_OBJECT_0) return true;
+            // Signalled: the transfer completed. Collect it so the buffer can
+            // be reused, then fall through to arm a fresh read.
+            DWORD bytesRead = 0;
+            readPending_ = false;
+            (void)GetOverlappedResult(handle_, &overlapped_, &bytesRead, FALSE);
+        }
+        return ensureReadPending(error);
+    }
+
     bool drainVendorReports() noexcept {
         if (vendorUnavailable_) return false;
         constexpr unsigned int kMaximumDrainedReports = 64;
         bool decoded = false;
         for (unsigned int drained = 0; drained < kMaximumDrainedReports; ++drained) {
-            const DWORD waitResult = WaitForSingleObject(event_, 0);
-            if (waitResult == WAIT_TIMEOUT) return decoded;
+            // LOCAL PATCH: a one-shot poll returns immediately when the vendor
+            // read has not completed yet, which lets a busy mapped-HID
+            // collection starve this stream forever. Wait a token amount so a
+            // frame already in flight is collected on this pass.
+            const DWORD timeout = drained == 0 ? 1U : 0U;
+            const DWORD waitResult = WaitForSingleObject(event_, timeout);
+            if (waitResult == WAIT_TIMEOUT) {
+                // LOCAL PATCH: the vendor stream must always be armed. When a
+                // previous read completed but its event was consumed by the
+                // mapped-HID branch, readPending_ still says "pending" and the
+                // stream dies silently: frame count freezes, no error counter
+                // moves, and the session aborts one second later. Re-arm
+                // unconditionally here — a live read simply keeps going, and a
+                // dead one is resurrected.
+                std::string pendingError;
+                if (!ensureReadArmed(pendingError)) {
+                    vendorUnavailable_ = true;
+                    ++vendorReadFailures_;
+                }
+                return decoded;
+            }
             if (waitResult != WAIT_OBJECT_0) {
                 vendorUnavailable_ = true;
                 ++vendorReadFailures_;
@@ -1068,20 +1206,41 @@ private:
         const auto vendorTriggerAge = lastVendorStateAt_
             ? now - *lastVendorStateAt_
             : std::chrono::steady_clock::duration::max();
+        // LOCAL PATCH: prefer the vendor frame outright for every standard
+        // control when one is available.
+        //
+        // The composer always merges the mapped HID collection over the vendor
+        // frame (mergeApex5MappedControls overwrites both sticks, both triggers,
+        // dpad and the whole button mask), so the mapped collection is on the
+        // critical path for input that the vendor frame already carries in full
+        // -- decodeVaderInputReport decodes sticks, triggers, dpad and all
+        // buttons from the 0xEF operator report. Measured on this machine: the
+        // mapped game-controller collection degrades from 220 reports/s in
+        // isolation to 23 reports/s (-90 %) once the bridge is running, with
+        // 815 timeouts over 136 s, while the vendor stream holds 412 frames/s.
+        // Letting the degraded collection overwrite good vendor data is what
+        // made the whole session freeze; the vendor frame alone is complete
+        // apart from IMU, which the Vader does not report at all.
+        if (vendorReady && lastVendorState_) {
+            state = *lastVendorState_;
+            state.batteryPercent = currentBatteryPercent_.load(std::memory_order_relaxed);
+            state.chargeState = currentChargeState_.load(std::memory_order_relaxed);
+            activity_.observe(state, now);
+            return;
+        }
+        if (!lastMappedState_) {
+            // Nothing to compose from yet; report neutral rather than dangling.
+            state = dualsense::DualSenseInputState{};
+            state.batteryPercent = currentBatteryPercent_.load(std::memory_order_relaxed);
+            state.chargeState = currentChargeState_.load(std::memory_order_relaxed);
+            return;
+        }
         state = composer_.compose(
             *lastMappedState_,
-            mappedInputObserved_ && vendorReady ? lastVendorState_ : std::nullopt,
+            std::nullopt,
             vendorTriggerAge,
             currentBatteryPercent_.load(std::memory_order_relaxed),
             currentChargeState_.load(std::memory_order_relaxed));
-        if (vendorReady && lastVendorState_) {
-            state.gyroX = lastVendorState_->gyroX;
-            state.gyroY = lastVendorState_->gyroY;
-            state.gyroZ = lastVendorState_->gyroZ;
-            state.accelX = lastVendorState_->accelX;
-            state.accelY = lastVendorState_->accelY;
-            state.accelZ = lastVendorState_->accelZ;
-        }
         activity_.observe(state, now);
     }
 
@@ -1107,8 +1266,7 @@ private:
     OVERLAPPED& overlapped_;
     bool readPending_ = false;
     std::vector<std::uint8_t>& report_;
-    std::optional<dualsense::DualSenseInputState> lastVendorState_;
-    std::optional<std::chrono::steady_clock::time_point> lastVendorStateAt_;
+    std::optional<dualsense::DualSenseInputState> lastVendorState_;    std::optional<std::chrono::steady_clock::time_point> lastVendorStateAt_;
     IndependentTriggerStreamFreshness independentTriggerFreshness_;
     flydigi::Apex5InputComposer composer_;
     PhysicalInputActivityTracker activity_;
@@ -1126,6 +1284,9 @@ private:
     std::optional<dualsense::DualSenseInputState> lastMappedState_;
     bool mappedInputObserved_ = false;
     bool xinputFallbackActive_ = false;
+    // LOCAL PATCH: true when this session drives a Vader 5 Pro, which uses the
+    // 0x00 report ID and its own 0xEF operator-report layout.
+    bool vaderProduct_ = false;
 };
 
 class XInputPhysicalInputSource final : public PhysicalInputSource {
@@ -1196,7 +1357,8 @@ private:
 std::unique_ptr<PhysicalInputSource> openPhysicalInputSource(
     const HidDeviceInfo& apexVendorInterface,
     std::optional<unsigned int> requestedXInputIndex,
-    std::string& error) {
+    std::string& error,
+    bool vaderOperatorReport) {
     if (!requestedXInputIndex) {
         if (flydigi::apex6::isProduct(
                 apexVendorInterface.vendorId, apexVendorInterface.productId)) {
@@ -1227,7 +1389,7 @@ std::unique_ptr<PhysicalInputSource> openPhysicalInputSource(
                 apexVendorInterface.vendorId, apexVendorInterface.productId)) {
             std::string apex5Error;
             auto apex5 = Apex5DualHidPhysicalInputSource::open(
-                apexVendorInterface, apex5Error);
+                apexVendorInterface, apex5Error, vaderOperatorReport);
             if (apex5) {
                 error.clear();
                 return apex5;

@@ -182,6 +182,14 @@ std::optional<VirtualDualSenseDiscovery> readNewVirtualDualSenseFirmware(
                 continue;
             }
 
+            // LOCAL PATCH: guard against a zero-length feature report. Writing
+            // report[0] on an empty vector is an out-of-bounds store that fails
+            // fast (0xC0000409) instead of reporting a HID capability problem.
+            if (info.featureReportLength == 0) {
+                lastError = "Virtual DualSense interface exposes no feature report; "
+                            "cannot read the firmware feature report.";
+                continue;
+            }
             std::vector<std::uint8_t> report(info.featureReportLength, 0);
             report[0] = 0x20;
             std::string featureError;

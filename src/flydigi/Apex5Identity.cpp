@@ -58,6 +58,48 @@ Report Apex5Identity::buildRequest() {
     return report;
 }
 
+std::optional<Apex5Identity> Apex5Identity::parseVaderReply(
+    std::span<const std::uint8_t> report) {
+    // VaderHaptics accepts both a bare 5A A5 ... frame and one carrying a stray
+    // leading 0x00 (tools/m1/vader_ds5_bridge/main.cpp ReadFlydigiCommandReply
+    // shifts the buffer when reply[0] != 0x5A && reply[1] == 0x5A). Reproduce
+    // that tolerance here, then require the standard Apex-family header.
+    // Reject frames that already carry the Apex-family input report ID: those
+    // belong to parseReply() and must not be reinterpreted as Vader replies
+    // (their DeviceType sits at a different offset and 128/129 are valid Apex 5
+    // types, so a stray shift here would misclassify them as a Vader).
+    if (!report.empty() && report[0] == kReportIdIn) return std::nullopt;
+
+    std::size_t offset = 0;
+    if (report.size() > 1 && report[0] != kMagic0 && report[1] == kMagic0) {
+        offset = 1;
+    }
+    if (report.size() < offset + 14) return std::nullopt;
+    if (report[offset] != kMagic0 ||
+        report[offset + 1] != kMagic1 ||
+        report[offset + 2] != kCmdGetInfo) {
+        return std::nullopt;
+    }
+
+    // Frame layout after the optional leading 0x00 shift:
+    //   [0]=5A [1]=A5 [2]=01(cmd) [3]=len [4]=deviceID [5]=DeviceType
+    //   [6]=connection [11]=battery [15..16]=firmware (little-endian)
+    const auto deviceType = report[offset + 5];
+    if (!isVader5ProDeviceType(deviceType)) return std::nullopt;
+
+    const auto connectionType = report[offset + 6];
+    const auto rawBattery = report[offset + 11];
+    const bool charging = (rawBattery >> 4U) != 0;
+    const auto rawLevel = static_cast<std::uint8_t>(rawBattery & 0x0F);
+    const auto level = rawLevel != 0
+        ? (rawLevel > 6 ? static_cast<std::uint8_t>(6) : rawLevel)
+        : (charging ? static_cast<std::uint8_t>(5) : static_cast<std::uint8_t>(0));
+    const auto firmware = static_cast<std::uint16_t>(
+        report[offset + 15] | (static_cast<std::uint16_t>(report[offset + 16]) << 8U));
+    return Apex5Identity(ApexProtocol::CurrentV2, deviceType,
+                         connectionType, level, charging, firmware);
+}
+
 std::optional<Apex5Identity> Apex5Identity::parseReply(
     std::span<const std::uint8_t> report) {
     if (report.size() < 14 ||
@@ -128,9 +170,17 @@ bool Apex5Identity::isApex5DeviceType(std::uint8_t deviceType) noexcept {
            kApex5DeviceTypes.end();
 }
 
+bool Apex5Identity::isVader5ProDeviceType(std::uint8_t deviceType) noexcept {
+    return deviceType == kVader5ProDeviceType;
+}
+
 std::string Apex5Identity::describe() const {
     std::ostringstream output;
-    if (isApex4()) {
+    if (isVader5Pro()) {
+        output << "Vader 5 Pro (f5, DeviceType "
+               << static_cast<unsigned int>(deviceType_)
+               << ", four-lane vibration, no adaptive-trigger resistance)";
+    } else if (isApex4()) {
         output << "Apex 4 (k2, DeviceType " << static_cast<unsigned int>(deviceType_);
         if (firmwareVersion_ != 0) {
             output << ", firmware 0x" << std::hex << std::uppercase

@@ -21,12 +21,17 @@ public:
     [[nodiscard]] static Report buildRequest();
     [[nodiscard]] static std::optional<Apex5Identity> parseReply(
         std::span<const std::uint8_t> report);
+    // Vader 5 Pro GET_INFO reply: bare 5A A5 01 frame (optionally with a stray
+    // leading 0x00) carrying DeviceType at [offset+3].
+    [[nodiscard]] static std::optional<Apex5Identity> parseVaderReply(
+        std::span<const std::uint8_t> report);
     [[nodiscard]] static std::optional<Apex5Identity> parseApex4Reply(
         std::span<const std::uint8_t> report);
     [[nodiscard]] static std::optional<Apex5Identity> parseApex6Reply(
         std::span<const std::uint8_t> report);
     [[nodiscard]] static bool isApex4DeviceType(std::uint8_t deviceType) noexcept;
     [[nodiscard]] static bool isApex5DeviceType(std::uint8_t deviceType) noexcept;
+    [[nodiscard]] static bool isVader5ProDeviceType(std::uint8_t deviceType) noexcept;
 
     [[nodiscard]] ApexProtocol protocol() const noexcept { return protocol_; }
     [[nodiscard]] std::uint8_t deviceType() const noexcept { return deviceType_; }
@@ -43,11 +48,22 @@ public:
     [[nodiscard]] bool isApex5() const noexcept {
         return protocol_ == ApexProtocol::CurrentV2 && isApex5DeviceType(deviceType_);
     }
+    // Vader 5 Pro (f5, DeviceType 130) speaks the same 0x5A 0xA5 command frame as
+    // the Apex5 V2 family but has no FORCEADAPT trigger hardware, so it must
+    // never reach the adaptive-trigger path. See kVader5ProDeviceType.
+    [[nodiscard]] bool isVader5Pro() const noexcept {
+        return protocol_ == ApexProtocol::CurrentV2 && deviceType_ == kVader5ProDeviceType;
+    }
     [[nodiscard]] bool isApex6() const noexcept {
         return protocol_ == ApexProtocol::RealtimeV3;
     }
+    // Vader 5 Pro carries two grip plus two trigger rumble lanes and no trigger
+    // resistance, so it is trigger-capable for input only.
     [[nodiscard]] bool supportsAdaptiveTriggers() const noexcept {
         return isApex4() || isApex5();
+    }
+    [[nodiscard]] bool supportsFourLaneVibration() const noexcept {
+        return isVader5Pro();
     }
     [[nodiscard]] bool supportsRealtimeHaptics() const noexcept {
         return isApex6() && (features_ & 0x80U) != 0 &&

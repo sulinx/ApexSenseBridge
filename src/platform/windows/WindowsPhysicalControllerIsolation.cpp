@@ -1238,10 +1238,10 @@ bool apexGameDevicePaths(const HidDeviceInfo& apexInterface,
     const auto expectedId = id.str();
     const bool apex4DInput = flydigi::isApex4Product(
         apexInterface.vendorId, apexInterface.productId);
-    bool foundHidGamepad = false;
-    bool foundUsbGameInterface = false;
+    bool foundHidGamepad = false;    bool foundUsbGameInterface = false;
     bool foundHidAuxiliaryInput = !apex4DInput;
     bool foundUsbAuxiliaryInput = !apex4DInput;
+    bool foundVendorInterface = false;
 
     for (DWORD index = 0;; ++index) {
         SP_DEVINFO_DATA info{};
@@ -1264,6 +1264,21 @@ bool apexGameDevicePaths(const HidDeviceInfo& apexInterface,
         // input, FORCEADAPT and rumble transports.
         const bool apex4AuxiliaryInput = apex4DInput &&
                                          normalized.find(L"&MI_01") != std::wstring::npos;
+        // LOCAL PATCH: hide the vendor HID collection (MI_01) as well.
+        //
+        // Measured on a Vader 5 Pro over the 2.4 GHz dongle: the operator stream
+        // ran at a steady ~410 frames/s and then stopped dead the instant a game
+        // launched -- reproducible at 62 s twice, with the decoded-frame counter
+        // frozen while read/parse failure counters stayed at zero. The game opens
+        // every HID collection it can find, and MI_01 is the vendor interface the
+        // bridge itself streams input from, so the game's open starved our read.
+        // MI_01 is a normal HIDClass device, so a HidHide blacklist entry does
+        // mask it from the game; the bridge keeps access through the application
+        // whitelist that activate() already registers for its own executable.
+        // MI_02/MI_03 stay visible: the bridge needs them and they carry no
+        // gamepad input.
+        const bool vaderVendorInterface = !apex4DInput &&
+            normalized.find(L"&MI_01") != std::wstring::npos;
         const bool hidGamepad = normalized.starts_with(L"HID\\") &&
             (apex4DInput
                  ? apex4Gamepad || apex4AuxiliaryInput
@@ -1271,6 +1286,14 @@ bool apexGameDevicePaths(const HidDeviceInfo& apexInterface,
         const bool usbGameInterface = normalized.starts_with(L"USB\\") &&
             (normalized.find(L"&MI_00") != std::wstring::npos ||
              apex4AuxiliaryInput);
+
+        // Vendor interface entries are collected separately from the gamepad set
+        // so the completeness checks below keep their original meaning.
+        if (vaderVendorInterface) {
+            if (!containsCaseInsensitive(paths, instance)) paths.push_back(instance);
+            foundVendorInterface = true;
+            continue;
+        }
         if (hidGamepad || usbGameInterface) {
             if (!containsCaseInsensitive(paths, instance)) paths.push_back(instance);
             foundHidGamepad = foundHidGamepad ||
@@ -1413,8 +1436,12 @@ RestoreOutcome restoreApexInputTransport(const detail::ApexSettingsRestore& sett
     for (int attempt = 1; attempt <= attempts; ++attempt) {
         std::string openError;
         auto device = flydigi::Apex5Device::open(selected, openError);
+        // LOCAL PATCH: the Vader 5 Pro accepts the same 0x11 input-transport
+        // restore and has no profile slots to worry about, so allow it here too.
         if (!device || !device->verifyIdentity(openError) ||
-            !device->identity() || !device->identity()->isApex5()) {
+            !device->identity() ||
+            !(device->identity()->isApex5() ||
+              device->identity()->isVader5Pro())) {
             lastError = openError.empty()
                 ? "The saved input-transport interface is not a verified Apex 5"
                 : openError;

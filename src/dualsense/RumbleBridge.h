@@ -3,6 +3,7 @@
 #include "dualsense/DualSenseFeedback.h"
 #include "flydigi/Apex5Device.h"
 #include "haptics/HapticProcessor.h"
+#include "haptics/TriggerSemanticAdapter.h"
 
 #include <atomic>
 #include <chrono>
@@ -46,6 +47,9 @@ public:
                           haptics::HapticConfig hapticConfig = {}, unsigned strengthPercent = 100);
 
     void handle(const DualSenseFeedback& feedback);
+    // Feed the live trigger axes so the ported TriggerSemanticAdapter can gate
+    // its trigger-lane drive on real pull. Safe to call from the input loop.
+    void setTriggerAxis(std::uint8_t left, std::uint8_t right) noexcept;
     [[nodiscard]] bool failed() const noexcept;
     [[nodiscard]] std::string error() const;
     [[nodiscard]] RumbleBridgeStats stats() const noexcept;
@@ -61,9 +65,18 @@ private:
 
     flydigi::Apex5Device& device_;
     haptics::HapticProcessor hapticProcessor_;
+    // Ported from VaderHaptics: turns DualSense adaptive-trigger metadata (which
+    // the Vader has no actuator for) into bounded trigger-lane vibration.
+    haptics::TriggerSemanticAdapter triggerAdapter_;
+    // Raw trigger axes in 0..255, updated by the input loop.
+    std::atomic_uint8_t leftTriggerAxis_{0};
+    std::atomic_uint8_t rightTriggerAxis_{0};
     unsigned strengthPercent_ = 100;
     RumbleLevels standard_{};
     RumbleLevels audio_{};
+    // Last feedback frame, kept so the trigger adapter can read the effect
+    // metadata and haptic samples at write time.
+    DualSenseFeedback lastFeedback_{};
     std::optional<RumbleLevels> previous_{RumbleLevels{}};
     Clock::time_point lastWriteAt_{Clock::now()};
     Clock::time_point lastAudioAt_{};

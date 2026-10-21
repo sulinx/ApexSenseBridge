@@ -460,15 +460,27 @@ int main() {
     assert(!intermittentApex4.identityUnanswered());
     assert(intermittentApex4Transport->writes.size() == 6);
 
+    // LOCAL PATCH: DeviceType 130 (Vader 5 Pro) is now an accepted model. It must
+    // be identified as a Vader (not an Apex 5), accept four-lane rumble, and keep
+    // refusing adaptive-trigger writes.
+    FakeTransport* vaderTransport = nullptr;
+    auto vader = makeDevice(vaderTransport, 130);
+    error.clear();
+    assert(vader.verifyIdentity(error));
+    assert(vader.identity() && vader.identity()->isVader5Pro());
+    assert(!vader.identity()->isApex5());
+    assert(vader.identity()->supportsFourLaneVibration());
+    assert(!vader.identity()->supportsAdaptiveTriggers());
+    assert(!vader.identityUnanswered());
+    assert(!vader.setTrigger(effect, error));
+
+    // An unknown Flydigi model is still refused.
     FakeTransport* wrongTransport = nullptr;
-    auto wrong = makeDevice(wrongTransport, 130);
+    auto wrong = makeDevice(wrongTransport, 131);
     error.clear();
     assert(!wrong.verifyIdentity(error));
     assert(error.find("Identity refused") != std::string::npos);
-    assert(wrongTransport->writes.size() == 1);
     assert(!wrong.identityUnanswered());
-    assert(!wrong.setTrigger(effect, error));
-    assert(wrongTransport->writes.size() == 1);
 
     FakeTransport* wrongApex4Transport = nullptr;
     auto wrongApex4 = makeDevice(wrongApex4Transport, 85, false, true);

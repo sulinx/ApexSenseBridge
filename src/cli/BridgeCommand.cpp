@@ -24,6 +24,7 @@
 #include "platform/HidTransport.h"
 #include "platform/AudioEndpointProtection.h"
 #include "platform/PhysicalControllerIsolation.h"
+
 #include "platform/PhysicalInputFreshnessWatchdog.h"
 #include "platform/PhysicalInputSource.h"
 #include "platform/SessionControl.h"
@@ -195,6 +196,24 @@ int commandBridgeTriggers(int argc, char** argv) {
     };
 
     if (stopRequested()) return cancelStartup();
+    // LOCAL PATCH: the Vader 5 Pro only emits its 0xEF operator stream while it
+    // holds a 0x1C ACQUIRE token, and the stream stops if no raw transport is
+    // requested. Take ownership *before* any baseline writes so no command ACK
+    // can displace the operator stream in the vendor queue.
+    const bool vaderOperatorReport = device->identity().has_value() &&
+                                     device->identity()->isVader5Pro();
+    if (vaderOperatorReport) {
+        if (!device->acquireController(true, error)) {
+            std::cerr << "Could not take control of the Vader 5 Pro: " << error
+                      << '\n';
+            return failSession(8, "Could not take control of the Vader 5 Pro: " + error);
+        }
+        if (!device->setInputTransport(true, true, error)) {
+            std::cerr << "Could not start the Vader operator stream: " << error
+                      << '\n';
+            return failSession(8, "Could not start the Vader operator stream: " + error);
+        }
+    }
     startup.enter("controller-snapshot");
     std::string deferredApexNotice;
     if (!asb::platform::TemporaryPhysicalControllerIsolation::applyDeferredApexRestore(
@@ -268,9 +287,24 @@ int commandBridgeTriggers(int argc, char** argv) {
             originalInputTransport = transport;
         }
     }
+    // LOCAL PATCH: the Vader never answers 0x10 (read transport status), so
+    // record the routing we requested as the restore target. Without this the
+    // recovery path refuses to restart the trigger stream ("transport is
+    // unknown") and the session aborts.
+    if (!originalInputTransport && vaderOperatorReport) {
+        asb::flydigi::InputTransportStatus known{};
+        known.controllerData = true;
+        known.rawData = true;
+        originalInputTransport = known;
+        std::cout << "Vader input transport snapshot: controller_data=1, "
+                     "raw_data=1 (assumed; the Vader does not answer 0x10)"
+                  << std::endl;
+    }
     if (originalInputTransport) {
         const auto flagText = [](asb::flydigi::TransportFlag flag) {
-            if (const auto value = flag.value()) return std::string(*value ? "1" : "0");
+            if (const auto value = flag.value()) {
+                return std::string(*value ? "1" : "0");
+            }
             std::ostringstream text;
             text << "unknown(0x" << std::hex << std::uppercase << std::setw(2)
                  << std::setfill('0') << static_cast<unsigned>(flag.raw) << ')';
@@ -279,8 +313,10 @@ int commandBridgeTriggers(int argc, char** argv) {
         std::cout << "Apex 5 input transport snapshot: controller_data="
                   << originalInputTransport->controllerData
                   << ", raw_data=" << originalInputTransport->rawData
-                  << ", keyboard_data=" << flagText(originalInputTransport->keyboardData)
-                  << ", mouse_data=" << flagText(originalInputTransport->mouseData)
+                  << ", keyboard_data="
+                  << flagText(originalInputTransport->keyboardData)
+                  << ", mouse_data="
+                  << flagText(originalInputTransport->mouseData)
                   << ", third_party_control="
                   << flagText(originalInputTransport->thirdPartyControl)
                   << std::endl;
@@ -312,9 +348,10 @@ int commandBridgeTriggers(int argc, char** argv) {
     } asyncWriteStop{&*device};
 
     if (stopRequested()) return cancelStartup();
+    // vaderOperatorReport was decided above so the ACQUIRE happens first.
     startup.enter("physical-input");
     auto inputSource = asb::platform::openPhysicalInputSource(
-        device->info(), options.xinputIndex, error);
+        device->info(), options.xinputIndex, error, vaderOperatorReport);
     if (!inputSource) {
         std::cerr << "Mandatory physical-input proxy creation failed: " << error << '\n';
         return failSession(8, "Mandatory physical-input proxy creation failed: " + error);
@@ -421,7 +458,11 @@ int commandBridgeTriggers(int argc, char** argv) {
                                 inspectHapticFormat = apex6Pro && options.routeRumble]
         (std::string& probeError) {
         startup.enter("firmware-check");
+        // LOCAL PATCH: stage markers to localize a fail-fast crash inside this
+        // callback when running on non-Apex hardware.
+        std::cerr << "[fw] enter" << std::endl;
         if (audioProtectionFuture.valid()) {
+            std::cerr << "[fw] awaiting previous protection" << std::endl;
             const bool previousProtectionOk = audioProtectionFuture.get();
             if (!previousProtectionOk) {
                 std::cerr << "Warning: Windows default-audio protection failed: "
@@ -429,18 +470,24 @@ int commandBridgeTriggers(int argc, char** argv) {
             }
         }
         audioProtectionError.clear();
+        std::cerr << "[fw] captured=" << (audioProtection.captured() ? 1 : 0)
+                  << " launching protection" << std::endl;
         // Start watching as soon as each virtual controller has accepted its
         // initial state. This covers both the first attach and an automatic
         // recreation without delaying HID readiness verification.
         audioProtectionFuture = std::async(
             std::launch::async,
             [&audioProtection, &audioProtectionError, inspectHapticFormat]() {
-                return !audioProtection.captured() ||
-                       audioProtection.protectAfterVirtualDualSenseStart(
+                if (audioProtection.captured()) return true;
+                return audioProtection.protectAfterVirtualDualSenseStart(
                            std::chrono::milliseconds(2000), audioProtectionError, inspectHapticFormat);
             });
-        return readNewVirtualDualSenseFirmware(
+        std::cerr << "[fw] calling readNewVirtualDualSenseFirmware" << std::endl;
+        auto probeResult = readNewVirtualDualSenseFirmware(
             preexistingDualSensePaths, std::chrono::milliseconds(3000), probeError);
+        std::cerr << "[fw] probe returned found=" << (probeResult ? 1 : 0)
+                  << " err=" << probeError << std::endl;
+        return probeResult;
     };
     const auto waitForRemoval = [&preexistingDualSensePaths, &startup](std::string& removalError) {
         startup.enter("virtual-dualsense");
@@ -655,7 +702,7 @@ int commandBridgeTriggers(int argc, char** argv) {
         do {
             reopenError.clear();
             inputSource = asb::platform::openPhysicalInputSource(
-                device->info(), options.xinputIndex, reopenError);
+                device->info(), options.xinputIndex, reopenError, vaderOperatorReport);
             if (!inputSource) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(25));
             }
@@ -718,7 +765,7 @@ int commandBridgeTriggers(int argc, char** argv) {
             accumulatePhysicalInputStats(retiredInputStats, inputSource->stats());
             inputSource.reset();
             inputSource = asb::platform::openPhysicalInputSource(
-                device->info(), options.xinputIndex, restartError);
+                device->info(), options.xinputIndex, restartError, vaderOperatorReport);
             if (!inputSource) return false;
             if (device->identity()) inputSource->setBatteryState(
                 device->identity()->batteryPercent(), device->identity()->chargeState());
@@ -960,10 +1007,42 @@ int commandBridgeTriggers(int argc, char** argv) {
     constexpr auto kInputKeepalive = std::chrono::milliseconds(100);
     auto lastBatteryRefreshAt = std::chrono::steady_clock::now();
     constexpr auto kBatteryRefreshInterval = std::chrono::seconds(15);
+    // LOCAL PATCH: the vendor operator stream is paced by the controller, not by
+    // us. A busy mapped-HID collection, a Windows scheduling spike, or an ACQUIRE
+    // renewal round trip can legitimately leave a >1 s gap between decodable
+    // frames while the device is perfectly healthy (measured peak: 1196 ms,
+    // which previously aborted a running session as "no fresh report for one
+    // second"). Three seconds still catches a genuinely dead stream -- the
+    // ACQUIRE token expires on a tens-of-seconds scale, so a real stop trips
+    // this quickly -- without treating jitter as a failure.
     asb::platform::PhysicalInputFreshnessWatchdog inputFreshness(
-        std::chrono::seconds(1), started);
+        std::chrono::seconds(3), started);
     asb::Apex4GyroValidation apex4GyroValidation;
     std::string asyncWriteError;
+    auto lastAcquireRenewAt = std::chrono::steady_clock::now();
+    // LOCAL PATCH: tracks decoded vendor frames so the freshness watchdog advances
+    // on real progress instead of on loop iterations (see the Timeout branch).
+    std::uint64_t lastObservedVendorStates = inputSource->stats().vendorStates;
+    // LOCAL PATCH: ACQUIRE recovery is event driven, not timer driven. See the
+    // renewal block below for the measurements behind this.
+    constexpr auto kAcquireRecoveryCooldown = std::chrono::seconds(4);
+    // LOCAL PATCH: bounded stream-recovery budget. A stalled Vader operator
+    // stream resumes on its own, so re-arming is cheap; a controller that is
+    // genuinely gone must still end the session, hence the small cap.
+    constexpr unsigned int kMaximumStreamRecoveries = 8;
+    std::uint64_t lastAcquireRenewAtVendorStates = lastObservedVendorStates;
+    // LOCAL PATCH: how many times the stalled operator stream was re-armed, and
+    // the frame count that attempt started from. Recovery counts as failed when
+    // the counter has not moved by the next verdict.
+    unsigned int streamRecoveries = 0;
+    std::uint64_t streamRecoveryBaselineStates = lastObservedVendorStates;
+    // LOCAL DIAG: heartbeat baseline for the two input channels.
+    auto lastHeartbeatAt = std::chrono::steady_clock::now();
+    std::uint64_t lastHeartbeatMapped = 0;
+    std::uint64_t lastHeartbeatVendor = lastObservedVendorStates;
+    // LOCAL DIAG: timestamp of the last watchdog refresh, so a trip can report
+    // how long the stream was actually considered silent.
+    std::chrono::steady_clock::time_point lastDiagnosticObserveAt = started;
     while (!g_stopRequested.load(std::memory_order_relaxed) &&
            !globalSessionStop->stopRequested() &&
            (!sessionControl || !sessionControl->stopRequested()) &&
@@ -972,11 +1051,91 @@ int commandBridgeTriggers(int argc, char** argv) {
            (!rumbleBridge || !rumbleBridge->failed()) &&
            !device->takeAsyncWriteError(asyncWriteError)) {
         const auto loopNow = std::chrono::steady_clock::now();
+        // LOCAL PATCH: the Vader only streams 0xEF frames while it holds the
+        // 0x1C ACQUIRE token, and that token expires. SDL's Flydigi driver
+        // renews it every 30 s; without renewal the operator stream stops dead
+        // after ~60 s with no error, which looks exactly like a dead input
+        // proxy (frame counters freeze, error counters stay zero). Renew ahead
+        // of that deadline. This counter is a plain local (not static) so two
+        // bridge sessions in one process cannot inherit a stale timestamp, and
+        // a successful renewal also refreshes the freshness watchdog: the round
+        // trip blocks the read loop, so counting it as silence is wrong.
+        // LOCAL PATCH: do NOT renew the 0x1C ACQUIRE token on a timer.
+        //
+        // Measured behaviour on this Vader 5 Pro + 2.4 GHz dongle:
+        //   - Three game-free sessions (45 s / 480 s / 360 s) held a perfectly
+        //     healthy operator stream (max decoded-frame gap 279-754 ms) with no
+        //     renewal at all past startup, so the token does not expire on a
+        //     tens-of-seconds scale on this firmware.
+        //   - Every session that renewed on a 15 s timer died at almost exactly
+        //     the same runtime. The renewal is actively harmful here:
+        //       * it takes the shared HID write lock behind feedback traffic,
+        //       * exchangeCommand drains up to 128 queued frames first,
+        //       * and its own 0x1C reply is consumed by the input source's
+        //         always-pending OVERLAPPED read, so the ACK never reaches the
+        //         waiter and it times out after 750 ms.
+        //     The logged failure (753 ms, "No Flydigi command 0x1C reply")
+        //     immediately preceded the 3 s stream stall that ended the session.
+        //
+        // So: only re-acquire if the operator stream actually goes quiet, which
+        // is the condition renewal was meant to cure in the first place. A
+        // recovery is attempted at most once per cooldown, and every attempt
+        // refreshes the watchdog on both sides so its own blocking time is never
+        // mistaken for stream silence.
+        if (vaderOperatorReport &&
+            loopNow - lastAcquireRenewAt >= kAcquireRecoveryCooldown) {
+            const auto vendorStatesForRecovery = inputSource->stats().vendorStates;
+            if (vendorStatesForRecovery == lastAcquireRenewAtVendorStates) {
+                lastAcquireRenewAt = loopNow;
+                lastAcquireRenewAtVendorStates = vendorStatesForRecovery;
+                const auto renewStartedAt = std::chrono::steady_clock::now();
+                inputFreshness.observeFreshState(renewStartedAt);
+                std::string renewError;
+                const bool renewed = device->acquireController(true, renewError);
+                const auto renewFinishedAt = std::chrono::steady_clock::now();
+                inputFreshness.observeFreshState(renewFinishedAt);
+                if (!renewed) {
+                    const auto renewMs = std::chrono::duration_cast<
+                        std::chrono::milliseconds>(renewFinishedAt - renewStartedAt).count();
+                    std::cerr << "Apex 5 ACQUIRE recovery failed after " << renewMs
+                              << " ms (stream still quiet): " << renewError << std::endl;
+                } else {
+                    std::cerr << "Apex 5 ACQUIRE recovery sent after a quiet operator stream."
+                              << std::endl;
+                }
+            } else {
+                // Stream is alive: push the next check out instead of renewing.
+                lastAcquireRenewAt = loopNow;
+                lastAcquireRenewAtVendorStates = vendorStatesForRecovery;
+            }
+        }
         if (device->identity() && device->identity()->isApex5() &&
             loopNow - lastBatteryRefreshAt >= kBatteryRefreshInterval) {
             lastBatteryRefreshAt = loopNow;
             std::string refreshError;
             (void)device->requestBatteryRefresh(refreshError);
+        }
+        // LOCAL DIAG: per-second health of BOTH input channels. The crash always
+        // ends with vendorStates frozen and every error counter at zero, so the
+        // only way to tell "vendor channel died alone" from "the whole device
+        // vanished" is to watch mappedReports and vendorStates side by side.
+        if (loopNow - lastHeartbeatAt >= std::chrono::seconds(10)) {
+            const auto stats = inputSource->stats();
+            const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                loopNow - lastHeartbeatAt).count();
+            const double seconds = elapsedMs > 0 ? elapsedMs / 1000.0 : 1.0;
+            const auto mappedDelta = stats.mappedReports - lastHeartbeatMapped;
+            const auto vendorDelta = stats.vendorStates - lastHeartbeatVendor;
+            std::cerr << "[hb] t="
+                      << std::chrono::duration_cast<std::chrono::seconds>(loopNow - started).count()
+                      << "s mapped=" << static_cast<unsigned long long>(mappedDelta / seconds)
+                      << "/s vendor=" << static_cast<unsigned long long>(vendorDelta / seconds)
+                      << "/s timeouts=" << stats.timeouts
+                      << " states=" << inputSource->stats().reports
+                      << " samples=" << inputSamples << std::endl;
+            lastHeartbeatAt = loopNow;
+            lastHeartbeatMapped = stats.mappedReports;
+            lastHeartbeatVendor = stats.vendorStates;
         }
         asb::dualsense::DualSenseInputState input{};
         const auto inputWait = inputSource->eventDriven()
@@ -1040,6 +1199,7 @@ int commandBridgeTriggers(int argc, char** argv) {
                           << "sent while that gyro is active.\n";
             }
             inputFreshness.observeFreshState(inputObservedAt);
+            lastDiagnosticObserveAt = inputObservedAt;
             if (apex6Bridge) {
                 apex6Bridge->updateTriggerPositions(input.l2, input.r2);
             }
@@ -1076,12 +1236,94 @@ int commandBridgeTriggers(int argc, char** argv) {
                             inputObservedAt - lastInputForwardedAt >= kInputKeepalive);
             if (!forwardInput) ++coalescedInputReports;
         } else if (inputStatus == asb::platform::PhysicalInputStatus::Timeout) {
+            // LOCAL PATCH: judge the stream by decoded frames, not by wall clock.
+            // The loop itself can be blocked for real time by a synchronous
+            // ACQUIRE renewal (bounded by a 750 ms HID reply timeout, and it also
+            // queues on the shared write lock behind feedback traffic), by a
+            // feedback write, or by a Windows scheduling spike. During any of
+            // those the vendor counter simply does not move, yet the device is
+            // healthy. Advancing the watchdog whenever vendorStates grew keeps a
+            // genuinely dead stream detectable (the counter freezes while time
+            // still passes) without aborting a session on a stalled loop.
+            const auto vendorStatesNow = inputSource->stats().vendorStates;
+            if (vendorStatesNow != lastObservedVendorStates) {
+                lastObservedVendorStates = vendorStatesNow;
+                inputFreshness.observeFreshState(inputObservedAt);
+            lastDiagnosticObserveAt = inputObservedAt;
+            }
             if (inputSource->eventDriven() && inputFreshness.expired(inputObservedAt)) {
+                // LOCAL PATCH: a stalled vendor stream is not necessarily a dead
+                // controller, but "I re-armed the read successfully" is NOT proof
+                // that it came back. Measured on a Vader 5 Pro over the 2.4 GHz
+                // dongle: the operator stream stops for 1.6-3.2 s under heavy use
+                // and resumes by itself, so re-arming first is worth trying. A
+                // first version treated recoverStream() == true as recovery and
+                // kept refreshing the watchdog, which turned a real stall into a
+                // session that never died and never delivered input again: the
+                // frame counter stayed frozen at 25016 while the bridge re-armed
+                // every six seconds forever.
+                //
+                // The only trustworthy evidence is vendorStates advancing. Each
+                // recovery attempt gets one full silence window to produce frames;
+                // if the counter is still frozen at the next verdict, the attempt
+                // failed and the budget shrinks. A stream that does advance resets
+                // the budget, so occasional hiccups cost nothing.
+                const auto sinceStartMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    inputObservedAt - started).count();
+                const bool framesArrived = vendorStatesNow != streamRecoveryBaselineStates;
+                if (framesArrived) {
+                    streamRecoveries = 0;
+                }
+                if (streamRecoveries < kMaximumStreamRecoveries) {
+                    ++streamRecoveries;
+                    streamRecoveryBaselineStates = vendorStatesNow;
+                    std::string recoverError;
+                    const bool rearmed = inputSource->recoverStream();
+                    std::cerr << "[recover] physical APEX stream quiet; attempt "
+                              << streamRecoveries << '/' << kMaximumStreamRecoveries
+                              << " (vendorStates=" << vendorStatesNow
+                              << (framesArrived ? " advanced" : " frozen")
+                              << " sinceStart=" << sinceStartMs << "ms rearmed="
+                              << (rearmed ? "yes" : "no") << ')' << std::endl;
+                    // Hold the last real input so the virtual pad does not snap
+                    // to neutral mid-gameplay, and retry after another window.
+                    lastObservedVendorStates = vendorStatesNow;
+                    if (lastPhysicalInput) {
+                        input = *lastPhysicalInput;
+                        forwardInput = !lastForwardedInput ||
+                                       *lastForwardedInput != input ||
+                                       inputObservedAt - lastInputForwardedAt >= kInputKeepalive;
+                    }
+                    continue;
+                }
+                // Budget spent without the counter ever advancing: genuinely dead.
+                // Dump the whole stats block so the next failure distinguishes a
+                // dead vendor channel (mapped HID still ticking) from a dead
+                // device (both frozen) without any further guessing.
+                const auto tripStats = inputSource->stats();
+                std::cerr << "[diag] input timeout trip: vendorStates=" << vendorStatesNow
+                          << " sinceStart=" << sinceStartMs << "ms"
+                          << " attempts=" << streamRecoveries << '\n'
+                          << "[diag]   reports=" << tripStats.reports
+                          << " mappedReports=" << tripStats.mappedReports
+                          << " vendorReports=" << tripStats.vendorReports
+                          << " vendorStates=" << tripStats.vendorStates
+                          << " vendorParseFailures=" << tripStats.vendorParseFailures
+                          << " vendorReadFailures=" << tripStats.vendorReadFailures << '\n'
+                          << "[diag]   timeouts=" << tripStats.timeouts
+                          << " parseFailures=" << tripStats.parseFailures
+                          << " inputSamples=" << inputSamples
+                          << " lastAgeMs="
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 inputObservedAt - lastDiagnosticObserveAt).count()
+                          << std::endl;
                 inputProxyFailed = true;
                 if (sessionControl) sessionControl->markInterrupted(asb::platform::SessionInterruption::InputStreamLost);
                 inputProxyError =
                     "The mandatory physical APEX input stream produced no fresh "
-                    "report for one second.";
+                    "report for three seconds, and re-arming the vendor read did "
+                    "not restart it after " + std::to_string(streamRecoveries) +
+                    " attempts.";
                 break;
             }
             if (lastPhysicalInput) {

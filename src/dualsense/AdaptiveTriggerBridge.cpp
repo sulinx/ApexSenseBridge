@@ -25,6 +25,69 @@ void AdaptiveTriggerBridge::handle(const DualSenseFeedback& feedback) {
     }
 }
 
+void AdaptiveTriggerBridge::applyVaderTriggerVibration(
+    TriggerSide side, const std::array<std::uint8_t, 11>& effect) {
+    // LOCAL PATCH: map a DualSense trigger effect mode onto trigger-motor
+    // amplitude. This is deliberately not a force simulation — it gives the
+    // player a per-effect tactile cue (a tick for a shot, a rumble for a saw,
+    // a swell for a bow) where a DualSense would have applied resistance.
+    const std::uint8_t mode = effect[0];
+    unsigned strength = 0;
+    switch (mode) {
+    case 0:   // Off / release
+    case 5:   // Feedback (treated as neutral by the translator)
+        strength = 0;
+        break;
+    case 1:   // Continuous resistance: proportional to the requested force
+        strength = std::max<std::uint8_t>(effect[1], 40);
+        break;
+    case 2:   // Section / breakpoint: a distinct pressure point
+    case 3:   // Sniper break
+        strength = std::max<std::uint8_t>(effect[2], 70);
+        break;
+    case 6:   // Oscillation (machine gun / galloping)
+    case 37:
+    case 38:
+        strength = std::max<std::uint8_t>(effect[1], 90);
+        break;
+    case 33:  // Weapon: a short, strong impulse
+        strength = std::max<std::uint8_t>(effect[1], 110);
+        break;
+    case 4:   // Lock: hold pressure
+        strength = 60;
+        break;
+    default:
+        strength = std::max<std::uint8_t>(effect[1], 30);
+        break;
+    }
+
+    if (mode != 0) {
+        active_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        neutral_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const auto lane = side == TriggerSide::Left ? 0U : 1U;
+    std::uint8_t leftLane = 0;
+    std::uint8_t rightLane = 0;
+    {
+        std::lock_guard lock(stateMutex_);
+        vaderTriggerLane_[lane] = strength;
+        leftLane = vaderTriggerLane_[0];
+        rightLane = vaderTriggerLane_[1];
+    }
+
+    std::string writeError;
+    if (!device_.queueVaderTriggerLane(leftLane, rightLane, writeError)) {
+        writeFailures_.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard lock(errorMutex_);
+        error_ = std::move(writeError);
+        // Do NOT set failed_ here: a trigger-lane miss on the Vader is a
+        // degraded cue, not a reason to tear down the session.
+    }
+    translated_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void AdaptiveTriggerBridge::recordBlock(TriggerSide side, std::uint8_t enableBits,
                                         const std::array<std::uint8_t, 11>& effect) {
     constexpr std::size_t kMaximumDistinctBlocks = 32;
@@ -61,6 +124,17 @@ void AdaptiveTriggerBridge::recordBlock(TriggerSide side, std::uint8_t enableBit
 void AdaptiveTriggerBridge::apply(TriggerSide side, std::uint8_t enableBits,
                                   const std::array<std::uint8_t, 11>& effect) {
     recordBlock(side, enableBits, effect);
+
+    // LOCAL PATCH: the Vader has no resistance actuator, so a DualSense trigger
+    // effect is rendered as trigger-motor vibration. Handling it here means the
+    // force-write path below never sees an unsupported device — previously that
+    // marked the bridge failed and aborted the whole session the moment a game
+    // sent its first trigger mode (observed with fx=05 at startup).
+    if (const auto& identity = device_.identity();
+        identity && identity->isVader5Pro()) {
+        applyVaderTriggerVibration(side, effect);
+        return;
+    }
 
     // Like a DualSense, keep the current effect: games such as Call of Duty interleave
     // empty blocks with active effects, and releasing on them makes the trigger oscillate.

@@ -10,6 +10,7 @@ int commandBridgeTriggers(int argc, char** argv);
 int commandList();
 int commandDryRun();
 int commandIdentify(int argc, char** argv);
+int commandHideFilterProbe(int argc, char** argv);
 int commandClear(int argc, char** argv);
 int commandTestRt(int argc, char** argv);
 int commandTestTrigger(int argc, char** argv);

@@ -21,10 +21,17 @@ RumbleBridge::RumbleBridge(flydigi::Apex5Device& device,
                            haptics::HapticConfig hapticConfig, unsigned strengthPercent)
     : device_(device), hapticProcessor_(hapticConfig), strengthPercent_(strengthPercent) {}
 
+void RumbleBridge::setTriggerAxis(std::uint8_t left, std::uint8_t right) noexcept {
+    leftTriggerAxis_.store(left, std::memory_order_relaxed);
+    rightTriggerAxis_.store(right, std::memory_order_relaxed);
+}
+
 void RumbleBridge::handle(const DualSenseFeedback& feedback) {
     if (failed_.load(std::memory_order_relaxed)) {
         return;
     }
+    // Keep the newest frame for the trigger adapter.
+    lastFeedback_ = feedback;
 
     const auto now = Clock::now();
     std::lock_guard lock(stateMutex_);
@@ -126,7 +133,28 @@ void RumbleBridge::writeDesiredLocked(RumbleLevels desired,
     }
 
     std::string writeError;
-    if (!device_.queueRumble(desired.lowFrequency, desired.highFrequency, writeError)) {
+    // LOCAL PATCH: on a Vader 5 Pro the same queued write also carries the two
+    // trigger lanes. The ported TriggerSemanticAdapter converts DualSense
+    // trigger metadata (resistance, which this pad cannot produce) into bounded
+    // trigger vibration gated by the live trigger axis. Non-Vader devices see
+    // the trigger lanes ignored inside queueVaderFourLane().
+    std::uint8_t leftTriggerLane = 0;
+    std::uint8_t rightTriggerLane = 0;
+    if (device_.identity() && device_.identity()->isVader5Pro()) {
+        const auto drive = triggerAdapter_.process(
+            lastFeedback_, leftTriggerAxis_.load(std::memory_order_relaxed),
+            rightTriggerAxis_.load(std::memory_order_relaxed),
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+        leftTriggerLane = static_cast<std::uint8_t>(
+            std::clamp(drive.leftTrigger, 0.0f, 1.0f) * 255.0f);
+        rightTriggerLane = static_cast<std::uint8_t>(
+            std::clamp(drive.rightTrigger, 0.0f, 1.0f) * 255.0f);
+    }
+    if (!device_.queueVaderFourLane(desired.lowFrequency, desired.highFrequency,
+                                    leftTriggerLane, rightTriggerLane,
+                                    writeError)) {
         writeFailures_.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard lock(errorMutex_);

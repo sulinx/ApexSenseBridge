@@ -258,6 +258,7 @@ bool Apex5Device::verifyIdentity(std::string& error,
     const auto bufferSize = std::max<std::size_t>(
         protocolInputSize, transport_->info().inputReportLength);
     std::vector<std::uint8_t> input(bufferSize, 0);
+    std::vector<std::string> diagnosticSamples;
 
     // Discard a bounded amount of input queued before this exchange. Motion
     // reports can arrive continuously, so the bound prevents a live stream
@@ -295,11 +296,28 @@ bool Apex5Device::verifyIdentity(std::string& error,
             error = "Identity check cancelled by a stop request";
             return false;
         }
-        const bool requestWritten = apex4
-            ? transport_->writeOutputReport(buildApex4IdentityRequest(), error)
-            : (apex6Pro
-                   ? transport_->writeOutputReport(apex6::buildGetInfo(), error)
-                   : transport_->writeOutputReport(Apex5Identity::buildRequest(), error));
+        // LOCAL PATCH: the Vader 5 Pro answers only report ID 0x00, while the
+        // Apex 5 family answers 0x03. Alternate the two low-risk read-only
+        // probes so one candidate interface can identify either product.
+        // Each generation keeps its own report type (apex6 is 33 bytes), so the
+        // writes are issued per branch instead of being copied into one buffer.
+        bool requestWritten = false;
+        if (apex4) {
+            requestWritten = transport_->writeOutputReport(
+                buildApex4IdentityRequest(), error);
+        }
+        else if (apex6Pro) {
+            requestWritten = transport_->writeOutputReport(
+                apex6::buildGetInfo(), error);
+        }
+        else if ((attempt % 2) == 0) {
+            requestWritten = transport_->writeOutputReport(
+                buildVaderIdentityRequest(), error);
+        }
+        else {
+            requestWritten = transport_->writeOutputReport(
+                Apex5Identity::buildRequest(), error);
+        }
         if (!requestWritten) {
             error = "Could not send the read-only Flydigi identity request: " + error;
             if (!apex4 && !apex6Pro) error += "; " + std::string(kApex5UnresponsiveHint);
@@ -329,6 +347,17 @@ bool Apex5Device::verifyIdentity(std::string& error,
             }
 
             const auto bytes = std::span<const std::uint8_t>(input.data(), bytesRead);
+            // LOCAL PATCH: keep the first few raw replies so a failed identity
+            // exchange on a non-Apex product (e.g. Vader 5 Pro) is diagnosable
+            // instead of silently reporting "did not answer".
+            if (bytesRead >= 6 && diagnosticSamples.size() < 4) {
+                std::ostringstream sample;
+                sample << std::hex << std::uppercase << std::setfill('0');
+                for (std::size_t i = 0; i < (std::min)(bytesRead, std::size_t{8}); ++i) {
+                    sample << std::setw(2) << static_cast<unsigned>(input[i]) << ' ';
+                }
+                diagnosticSamples.push_back(sample.str());
+            }
             if (apex4) apex4Observation.record(bytes);
             if (apex6Pro) {
                 const auto info = apex6::parseDeviceInfo(bytes);
@@ -343,22 +372,38 @@ bool Apex5Device::verifyIdentity(std::string& error,
                     return false;
                 }
             }
-            const auto parsed = apex4
-                ? Apex5Identity::parseApex4Reply(bytes)
-                : (apex6Pro ? Apex5Identity::parseApex6Reply(bytes)
-                            : Apex5Identity::parseReply(bytes));
+            // LOCAL PATCH: on the non-Apex4/Apex6 path try the tolerant Vader
+            // parser first (it tolerates a stray leading 0x00 and the 0x00
+            // report ID), then fall back to the strict Apex 5 parser.
+            std::optional<Apex5Identity> parsed;
+            if (apex4) {
+                parsed = Apex5Identity::parseApex4Reply(bytes);
+            }
+            else if (apex6Pro) {
+                parsed = Apex5Identity::parseApex6Reply(bytes);
+            }
+            else {
+                parsed = Apex5Identity::parseVaderReply(bytes);
+                if (!parsed) parsed = Apex5Identity::parseReply(bytes);
+            }
             if (!parsed) continue;
 
+            // LOCAL PATCH: Vader 5 Pro (DeviceType 130) shares the V2 command
+            // frame with the Apex 5 family but has no FORCEADAPT hardware. It is
+            // accepted here for four-lane rumble only; adaptive-trigger writes
+            // stay gated behind supportsAdaptiveTriggers() in mayWriteEffects().
             const bool expectedModel = apex4 ? parsed->isApex4()
-                : (apex6Pro ? parsed->isApex6() : parsed->isApex5());
+                : (apex6Pro ? parsed->isApex6()
+                            : (parsed->isApex5() || parsed->isVader5Pro()));
             const bool expectedCapabilities = apex6Pro
                 ? parsed->supportsRealtimeHaptics()
-                : parsed->supportsAdaptiveTriggers();
+                : (parsed->supportsAdaptiveTriggers() || parsed->supportsFourLaneVibration());
             if (!expectedModel || !expectedCapabilities) {
                 error = "Identity refused: found " + parsed->describe() +
                         (apex6Pro
                              ? "; realtime haptics require an Apex 6 Pro with grip and trigger haptics."
-                             : "; adaptive-trigger writes require an Apex 4 (k2) or Apex 5 (k5).");
+                             : "; four-lane rumble requires a Vader 5 Pro and "
+                               "adaptive-trigger writes require an Apex 4 (k2) or Apex 5 (k5).");
                 return false;
             }
             identity_ = *parsed;
@@ -378,6 +423,17 @@ bool Apex5Device::verifyIdentity(std::string& error,
         error = "No valid command 0x01 Apex 5 identity reply arrived after three attempts; " +
                 std::string(kApex5UnresponsiveHint);
     }
+    // LOCAL PATCH: append what the vendor interface actually sent back so a
+    // non-Apex product (Vader 5 Pro) is diagnosable from the CLI.
+    if (!diagnosticSamples.empty()) {
+        error += " | raw replies:";
+        for (const auto& sample : diagnosticSamples) {
+            error += " [" + sample + "]";
+        }
+    }
+    else {
+        error += " | raw replies: none read";
+    }
     return false;
 }
 
@@ -386,9 +442,25 @@ bool Apex5Device::mayWriteEffects(std::string& error) const {
         error = "Effect write refused: device identity was not verified";
         return false;
     }
-    if (!identity_->supportsAdaptiveTriggers()) {
+    // LOCAL PATCH: the Vader 5 Pro may receive rumble/lightbar writes but has no
+    // FORCEADAPT trigger hardware, so trigger writes are rejected separately in
+    // setTrigger()/clearTrigger() via mayWriteTriggerEffects().
+    if (!identity_->supportsAdaptiveTriggers() && !identity_->supportsFourLaneVibration()) {
         error = "Effect write refused: " + identity_->describe() +
-                " is not a verified Apex 4 or Apex 5";
+                " is not a verified Apex 4, Apex 5, or Vader 5 Pro";
+        return false;
+    }
+    return true;
+}
+
+bool Apex5Device::mayWriteTriggerEffects(std::string& error) const {
+    if (!identity_) {
+        error = "Trigger write refused: device identity was not verified";
+        return false;
+    }
+    if (!identity_->supportsAdaptiveTriggers()) {
+        error = "Trigger write refused: " + identity_->describe() +
+                " has no adaptive-trigger resistance hardware";
         return false;
     }
     return true;
@@ -406,6 +478,26 @@ bool Apex5Device::mayControlProfiles(std::string& error) const {
     if (!identity_->isApex5()) {
         error = "Profile command refused: this diagnostic currently supports only "
                 "a verified Apex 5";
+        return false;
+    }
+    return true;
+}
+
+// LOCAL PATCH: the Vader 5 Pro has no onboard profile slots and no RGB config,
+// but it does accept the 0x11 input-transport command, which is the only way to
+// start its 0xEF operator stream. Gate that narrower capability separately so
+// profile/RGB writes stay Apex-5 only.
+bool Apex5Device::mayControlInputTransport(std::string& error) const {
+    if (!isOpen()) {
+        error = "APEX device is not open";
+        return false;
+    }
+    if (!identity_) {
+        error = "Input transport refused: device identity was not verified";
+        return false;
+    }
+    if (!identity_->isApex5() && !identity_->isVader5Pro()) {
+        error = "Input transport refused: unsupported controller";
         return false;
     }
     return true;
@@ -490,7 +582,7 @@ bool Apex5Device::setTrigger(const TriggerEffect& effect, std::string& error) {
         error = "APEX device is not open";
         return false;
     }
-    if (!mayWriteEffects(error)) {
+    if (!mayWriteTriggerEffects(error)) {
         return false;
     }
     const auto lock = acquireWriteLock();
@@ -506,7 +598,7 @@ bool Apex5Device::setTriggerRaw(const ForceTriggerCommand& command, std::string&
         error = "APEX device is not open";
         return false;
     }
-    if (!mayWriteEffects(error)) {
+    if (!mayWriteTriggerEffects(error)) {
         return false;
     }
     const auto lock = acquireWriteLock();
@@ -520,7 +612,7 @@ bool Apex5Device::clearTrigger(TriggerSide side, std::string& error) {
         error = "APEX device is not open";
         return false;
     }
-    if (!mayWriteEffects(error)) {
+    if (!mayWriteTriggerEffects(error)) {
         return false;
     }
     const auto lock = acquireWriteLock();
@@ -528,10 +620,16 @@ bool Apex5Device::clearTrigger(TriggerSide side, std::string& error) {
         ? writeSpacedOutputReport(buildApex4Normal(side), error)
         : writeFeedbackReport(buildNormal(side), true, error);
 }
-
 bool Apex5Device::clearAll(std::string& error) {
     if (!mayWriteEffects(error)) {
         return false;
+    }
+    // LOCAL PATCH: a Vader 5 Pro has no trigger resistance, so there is no
+    // trigger baseline to clear. Treat it as a successful no-op instead of
+    // failing the whole bridge startup on a hardware capability it lacks.
+    if (identity_ && identity_->isVader5Pro()) {
+        const auto lock = acquireWriteLock();
+        return stopRumble(error);
     }
     const auto lock = acquireWriteLock();
     std::string leftError;
@@ -563,11 +661,38 @@ bool Apex5Device::setRumble(std::uint8_t lowFrequencyMotor,
         return false;
     }
     const auto lock = acquireWriteLock();
+    if (identity_ && identity_->isVader5Pro()) {
+        // LOCAL PATCH: the Vader carries four rumble lanes in one 0x12 frame.
+        // The Apex-shaped two-motor API maps to the two grip lanes and leaves the
+        // trigger lanes silent; use setVaderFourLane() to drive all four.
+        return writeFeedbackReport(
+            buildVaderRumble(lowFrequencyMotor, highFrequencyMotor, 0, 0),
+            false, error);
+    }
     return identity_->isApex4()
         ? writeSpacedOutputReport(
               buildApex4Rumble(lowFrequencyMotor, highFrequencyMotor), error)
         : writeFeedbackReport(
               buildRumble(lowFrequencyMotor, highFrequencyMotor), false, error);
+}
+
+bool Apex5Device::setVaderFourLane(std::uint8_t leftGrip,
+                                   std::uint8_t rightGrip,
+                                   std::uint8_t leftTrigger,
+                                   std::uint8_t rightTrigger,
+                                   std::string& error) {
+    if (!isOpen()) {
+        error = "APEX device is not open";
+        return false;
+    }
+    if (!identity_ || !identity_->isVader5Pro()) {
+        error = "Four-lane rumble refused: device is not a verified Vader 5 Pro";
+        return false;
+    }
+    const auto lock = acquireWriteLock();
+    return writeFeedbackReport(
+        buildVaderRumble(leftGrip, rightGrip, leftTrigger, rightTrigger),
+        false, error);
 }
 
 bool Apex5Device::stopRumble(std::string& error) {
@@ -661,7 +786,7 @@ bool Apex5Device::applyProfile(std::uint8_t slot, std::string& error) {
 
 bool Apex5Device::readInputTransportStatus(InputTransportStatus& status,
                                            std::string& error) {
-    if (!mayControlProfiles(error)) return false;
+    if (!mayControlInputTransport(error)) return false;
     const auto lock = acquireWriteLock();
     const auto reply = exchangeCommand(
         *transport_, buildInputTransportStatusRequest(),
@@ -676,9 +801,25 @@ bool Apex5Device::readInputTransportStatus(InputTransportStatus& status,
     return true;
 }
 
+bool Apex5Device::acquireController(bool acquire, std::string& error) {
+    if (!mayControlInputTransport(error)) return false;
+    const auto lock = acquireWriteLock();
+    if (!exchangeCommand(*transport_, buildAcquire(acquire), kCmdAcquire,
+                         error)) {
+        return false;
+    }
+    controllerAcquired_ = acquire;
+    return true;
+}
+
 bool Apex5Device::setInputTransport(bool controllerData, bool rawData,
                                     std::string& error) {
-    if (!mayControlProfiles(error)) return false;
+    if (!mayControlInputTransport(error)) return false;
+    // LOCAL PATCH: the Vader only streams 0xEF frames after ACQUIRE, so take
+    // ownership first when the caller is driving that product.
+    if (identity_ && identity_->isVader5Pro() && !controllerAcquired_) {
+        if (!acquireController(true, error)) return false;
+    }
     // Runtime recovery shares this transport with feedback writes. Keep the
     // request, ACK and readback atomic with respect to that callback.
     const auto lock = acquireWriteLock();
@@ -686,6 +827,13 @@ bool Apex5Device::setInputTransport(bool controllerData, bool rawData,
             *transport_, buildSetInputTransport(controllerData, rawData),
             kCmdSetInputTransport, error)) {
         return false;
+    }
+
+    // LOCAL PATCH: the Vader does not answer 0x10 (read transport status), so
+    // its 0x11 ACK is the only confirmation available. Verify by watching for
+    // the operator stream instead of an unsupported readback.
+    if (identity_ && identity_->isVader5Pro()) {
+        return true;
     }
 
     InputTransportStatus effective{};
@@ -942,8 +1090,39 @@ bool Apex5Device::queueTriggerRaw(const ForceTriggerCommand& command,
 bool Apex5Device::queueRumble(std::uint8_t lowFrequencyMotor,
                               std::uint8_t highFrequencyMotor,
                               std::string& error) {
+    return queueVaderFourLane(lowFrequencyMotor, highFrequencyMotor, 0, 0, error);
+}
+
+// LOCAL PATCH: update only the Vader's trigger motor lanes, leaving the grip
+// pair at whatever the rumble path last set. Needed because a DualSense trigger
+// effect arrives on its own stream and must not clobber grip vibration.
+bool Apex5Device::queueVaderTriggerLane(std::uint8_t leftTrigger,
+                                        std::uint8_t rightTrigger,
+                                        std::string& error) {
+    std::uint8_t leftGrip = 0;
+    std::uint8_t rightGrip = 0;
+    if (asyncWritesRunning_.load(std::memory_order_acquire)) {
+        std::lock_guard lock(queueMutex_);
+        if (pendingRumble_) {
+            leftGrip = pendingRumble_->first;
+            rightGrip = pendingRumble_->second;
+        }
+    }
+    return queueVaderFourLane(leftGrip, rightGrip, leftTrigger, rightTrigger,
+                              error);
+}
+
+bool Apex5Device::queueVaderFourLane(std::uint8_t leftGrip,
+                                     std::uint8_t rightGrip,
+                                     std::uint8_t leftTrigger,
+                                     std::uint8_t rightTrigger,
+                                     std::string& error) {
     if (!asyncWritesRunning_.load(std::memory_order_acquire)) {
-        return setRumble(lowFrequencyMotor, highFrequencyMotor, error);
+        if (identity_ && identity_->isVader5Pro()) {
+            return setVaderFourLane(leftGrip, rightGrip, leftTrigger,
+                                    rightTrigger, error);
+        }
+        return setRumble(leftGrip, rightGrip, error);
     }
     {
         std::lock_guard lock(queueMutex_);
@@ -953,7 +1132,11 @@ bool Apex5Device::queueRumble(std::uint8_t lowFrequencyMotor,
         }
         pendingAt_[2] = std::chrono::steady_clock::now();
         if (!pendingRumble_) rumblePendingSince_ = pendingAt_[2];
-        pendingRumble_ = std::pair{lowFrequencyMotor, highFrequencyMotor};
+        // Trigger lanes ride the same newest-wins slot as the grip pair so the
+        // four values are always written together (see writerLoop).
+        pendingRumble_ = std::pair{leftGrip, rightGrip};
+        pendingLeftTriggerLane_ = leftTrigger;
+        pendingRightTriggerLane_ = rightTrigger;
     }
     queueSignal_.notify_one();
     return true;
@@ -1001,6 +1184,10 @@ void Apex5Device::writerLoop() {
 
         std::optional<ForceTriggerCommand> trigger;
         std::optional<std::pair<std::uint8_t, std::uint8_t>> rumble;
+        // LOCAL PATCH: capture the trigger lanes under the same lock that
+        // producers use, so the four values stay consistent and race-free.
+        std::uint8_t leftTriggerLane = 0;
+        std::uint8_t rightTriggerLane = 0;
         auto queuedAt = std::chrono::steady_clock::time_point{};
         auto rumbleHeldUntil = std::chrono::steady_clock::time_point{};
         {
@@ -1031,6 +1218,10 @@ void Apex5Device::writerLoop() {
                 queuedAt = pendingAt_[slot];
                 break;
             }
+            if (rumble) {
+                leftTriggerLane = pendingLeftTriggerLane_;
+                rightTriggerLane = pendingRightTriggerLane_;
+            }
         }
         if (!trigger && !rumble) {
             if (writeLock.owns_lock()) writeLock.unlock();
@@ -1043,8 +1234,18 @@ void Apex5Device::writerLoop() {
 
         std::string error;
         const auto startedAt = std::chrono::steady_clock::now();
-        const bool ok = trigger ? setTriggerRaw(*trigger, error)
-                                : setRumble(rumble->first, rumble->second, error);
+        bool ok = false;
+        if (trigger) {
+            ok = setTriggerRaw(*trigger, error);
+        }
+        else if (identity_ && identity_->isVader5Pro()) {
+            // LOCAL PATCH: the Vader writes all four lanes in one 0x12 frame.
+            ok = setVaderFourLane(rumble->first, rumble->second,
+                                  leftTriggerLane, rightTriggerLane, error);
+        }
+        else {
+            ok = setRumble(rumble->first, rumble->second, error);
+        }
         const auto elapsedUs = [](auto duration) {
             return static_cast<std::uint64_t>(
                 std::chrono::duration_cast<std::chrono::microseconds>(duration).count());

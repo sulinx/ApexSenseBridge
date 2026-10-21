@@ -33,6 +33,7 @@ add_library(asb_core STATIC
     src/dualsense/LightbarBridge.cpp
     src/dualsense/ViiperProtocol.cpp
     src/haptics/HapticProcessor.cpp
+    src/haptics/TriggerSemanticAdapter.cpp
     src/platform/Apex6InputFusion.cpp
     src/platform/AudioEndpointProtection.cpp
     src/platform/HidTransport.cpp
@@ -57,6 +58,7 @@ if(WIN32)
         src/platform/windows/WindowsVirtualDualSense.cpp
         src/platform/windows/WindowsXInputGamepad.cpp
         src/platform/windows/WindowsPhysicalControllerIsolation.cpp
+    src/platform/windows/WindowsHideFilterIsolation.cpp
         src/platform/windows/WindowsPhysicalInputSource.cpp
         src/platform/windows/WindowsSessionControl.cpp
     )
@@ -293,6 +295,7 @@ if(BUILD_TESTING)
     add_executable(ApexSenseBridgeHapticProcessorTests
         tests/test_haptic_processor.cpp
         src/haptics/HapticProcessor.cpp
+    src/haptics/TriggerSemanticAdapter.cpp
     )
     target_include_directories(ApexSenseBridgeHapticProcessorTests PRIVATE src)
     if(MSVC)
@@ -301,6 +304,19 @@ if(BUILD_TESTING)
         target_compile_options(ApexSenseBridgeHapticProcessorTests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME haptic_processor COMMAND ApexSenseBridgeHapticProcessorTests)
+
+    add_executable(ApexSenseBridgeTriggerSemanticAdapterTests
+        tests/test_trigger_semantic_adapter.cpp
+        src/haptics/TriggerSemanticAdapter.cpp
+    )
+    target_include_directories(ApexSenseBridgeTriggerSemanticAdapterTests PRIVATE src)
+    if(MSVC)
+        target_compile_options(ApexSenseBridgeTriggerSemanticAdapterTests PRIVATE /W4 /permissive- /EHsc)
+    else()
+        target_compile_options(ApexSenseBridgeTriggerSemanticAdapterTests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME trigger_semantic_adapter COMMAND ApexSenseBridgeTriggerSemanticAdapterTests)
+
 
     add_executable(ApexSenseBridgeXInputMappingTests
         tests/test_xinput_mapping.cpp
@@ -489,6 +505,18 @@ if(BUILD_TESTING)
         endif()
         add_test(NAME hid_transport_windows
                  COMMAND ApexSenseBridgeHidTransportWindowsTests)
+
+        add_executable(ApexSenseBridgeHideFilterIsolationTests
+            tests/test_hide_filter_isolation.cpp
+        )
+        target_link_libraries(ApexSenseBridgeHideFilterIsolationTests PRIVATE asb_core)
+        if(MSVC)
+            target_compile_options(ApexSenseBridgeHideFilterIsolationTests PRIVATE /W4 /permissive- /EHsc)
+        else()
+            target_compile_options(ApexSenseBridgeHideFilterIsolationTests PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        add_test(NAME hide_filter_isolation
+                 COMMAND ApexSenseBridgeHideFilterIsolationTests)
 
         add_test(NAME installer_registry_contract
                  COMMAND powershell -NoProfile -NonInteractive

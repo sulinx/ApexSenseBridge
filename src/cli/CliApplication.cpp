@@ -11,6 +11,7 @@
 #include "flydigi/Apex5Device.h"
 #include "flydigi/Apex5Protocol.h"
 #include "platform/HidTransport.h"
+#include "platform/HideFilterIsolation.h"
 #include "platform/AudioEndpointProtection.h"
 #include "platform/PhysicalControllerIsolation.h"
 #include "platform/PhysicalInputSource.h"
@@ -59,6 +60,8 @@ void printUsage() {
         << "                               Validate the complete APEX input proxy source\n"
         << "  stop-active-sessions         Gracefully detach/restore an active bridge\n"
         << "  identify [index]             Read and verify the Flydigi APEX identity\n"
+        << "  hidefilter-probe [--index N] [--hold SECONDS]\n"
+        << "                               Test a kernel class filter's device-visibility IOCTL\n"
         << "  virtual-ds [--seconds N] [--json] [--viiper PATH] [--virtual-backend NAME]\n"
         << "                               Create a neutral virtual DualSense and count feedback\n"
         << "  bridge-triggers [index] [--seconds N] [--viiper PATH]\n"
@@ -216,6 +219,9 @@ int run(int argc, char** argv) {
     }
     if (command == "identify") {
         return commandIdentify(argc, argv);
+    }
+    if (command == "hidefilter-probe") {
+        return commandHideFilterProbe(argc, argv);
     }
     if (command == "virtual-ds") {
         return commandVirtualDs(argc, argv);

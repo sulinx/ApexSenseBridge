@@ -78,6 +78,13 @@ public:
                    std::uint8_t highFrequencyMotor,
                    std::string& error);
     bool stopRumble(std::string& error);
+    // LOCAL PATCH: Vader 5 Pro only. Drives all four rumble lanes in one frame
+    // (left grip, right grip, left trigger, right trigger).
+    bool setVaderFourLane(std::uint8_t leftGrip,
+                          std::uint8_t rightGrip,
+                          std::uint8_t leftTrigger,
+                          std::uint8_t rightTrigger,
+                          std::string& error);
     bool enableApex6Haptics(std::string& error);
     bool writeApex6Haptics(const apex6::MotorBlock& block,
                            apex6::TriggerRoute route,
@@ -102,6 +109,10 @@ public:
                                   std::string& error);
     bool setInputTransport(bool controllerData, bool rawData,
                            std::string& error);
+    // LOCAL PATCH: 0x1C ACQUIRE / release. The Vader 5 Pro only emits its 0xEF
+    // operator stream while this ownership token is held (SDL renews it every
+    // 30 s); Apex 5 accepts it too but does not require it.
+    bool acquireController(bool acquire, std::string& error);
     bool requestBatteryRefresh(std::string& error);
 
     // Support diagnostic only. Reads the verified vendor HID stream without
@@ -121,6 +132,19 @@ public:
     bool queueRumble(std::uint8_t lowFrequencyMotor,
                      std::uint8_t highFrequencyMotor,
                      std::string& error);
+    // LOCAL PATCH: Vader 5 Pro four-lane queued write. On non-Vader devices the
+    // trigger lanes are ignored and the call degrades to queueRumble().
+    bool queueVaderFourLane(std::uint8_t leftGrip,
+                            std::uint8_t rightGrip,
+                            std::uint8_t leftTrigger,
+                            std::uint8_t rightTrigger,
+                            std::string& error);
+    // LOCAL PATCH: drive only the trigger motor lanes, preserving the grip pair
+    // currently queued. Used to render DualSense trigger effects as vibration on
+    // the Vader, which has no resistance actuator.
+    bool queueVaderTriggerLane(std::uint8_t leftTrigger,
+                               std::uint8_t rightTrigger,
+                               std::string& error);
     [[nodiscard]] std::uint64_t asyncWriteRetries() const noexcept;
     [[nodiscard]] AsyncWriteStats asyncWriteStats() const noexcept;
     [[nodiscard]] std::optional<AsyncWritePolicy> asyncWritePolicy() const noexcept;
@@ -131,8 +155,13 @@ public:
 
 private:
     [[nodiscard]] bool mayWriteEffects(std::string& error) const;
+    [[nodiscard]] bool mayWriteTriggerEffects(std::string& error) const;
     [[nodiscard]] bool mayWriteApex6Haptics(std::string& error) const;
     [[nodiscard]] bool mayControlProfiles(std::string& error) const;
+    // LOCAL PATCH: the Vader 5 Pro accepts the 0x11 input-transport command
+    // (needed to start its 0xEF operator stream) but has no profile slots, so
+    // this capability is gated separately from mayControlProfiles().
+    [[nodiscard]] bool mayControlInputTransport(std::string& error) const;
     [[nodiscard]] bool usesApex4Protocol() const noexcept;
     [[nodiscard]] bool usesApex6Protocol() const noexcept;
     [[nodiscard]] std::unique_lock<std::recursive_mutex> acquireWriteLock() const noexcept;
@@ -148,6 +177,8 @@ private:
     TransportPtr transport_{};
     std::optional<Apex5Identity> identity_{};
     bool identityUnanswered_ = false;
+    // LOCAL PATCH: tracks the 0x1C ACQUIRE ownership token for the Vader.
+    bool controllerAcquired_ = false;
     mutable std::unique_ptr<std::recursive_mutex> writeMutex_{std::make_unique<std::recursive_mutex>()};
     std::chrono::steady_clock::time_point lastVendorWriteAt_{};
     std::chrono::steady_clock::time_point lastTriggerWriteAt_{};
@@ -159,6 +190,8 @@ private:
     std::optional<ForceTriggerCommand> pendingLeftTrigger_{};
     std::optional<ForceTriggerCommand> pendingRightTrigger_{};
     std::optional<std::pair<std::uint8_t, std::uint8_t>> pendingRumble_{};
+    std::uint8_t pendingLeftTriggerLane_ = 0;
+    std::uint8_t pendingRightTriggerLane_ = 0;
     std::array<std::chrono::steady_clock::time_point, 3> pendingAt_{};
     std::chrono::steady_clock::time_point rumblePendingSince_{};
     unsigned nextSlot_ = 0;

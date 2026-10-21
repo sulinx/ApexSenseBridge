@@ -17,6 +17,7 @@
 #include "flydigi/Apex4Protocol.h"
 #include "flydigi/Apex5Protocol.h"
 #include "platform/HidTransport.h"
+#include "platform/HideFilterIsolation.h"
 #include "platform/AudioEndpointProtection.h"
 #include "platform/PhysicalControllerIsolation.h"
 #include "platform/PhysicalInputSource.h"
@@ -112,8 +113,27 @@ int runInputStatus(asb::flydigi::Apex5Device& device,
                    unsigned long seconds,
                    bool json) {
     std::string error;
+    // LOCAL PATCH: mirror the bridge path so diagnostics decode the same frame
+    // layout as a live session (Vader 5 Pro uses the 0x00 / 0xEF layout).
+    const bool vaderOperatorReport = device.identity().has_value() &&
+                                     device.identity()->isVader5Pro();
+    // The Vader only emits its 0xEF operator stream once it holds the 0x1C
+    // ACQUIRE token and raw data is requested, exactly like the bridge path.
+    if (vaderOperatorReport) {
+        std::string transportError;
+        if (!device.acquireController(true, transportError)) {
+            std::cerr << "Could not take control of the Vader 5 Pro: "
+                      << transportError << '\n';
+            return 3;
+        }
+        if (!device.setInputTransport(true, true, transportError)) {
+            std::cerr << "Could not start the Vader operator stream: "
+                      << transportError << '\n';
+            return 3;
+        }
+    }
     auto input = asb::platform::openPhysicalInputSource(
-        device.info(), std::nullopt, error);
+        device.info(), std::nullopt, error, vaderOperatorReport);
     if (!input) {
         std::cerr << "Complete APEX input source unavailable: " << error << '\n';
         return 3;
@@ -382,6 +402,111 @@ int commandIdentify(int argc, char** argv) {
               << "Realtime voice-coil haptics: "
               << (identity->supportsRealtimeHaptics() ? "yes" : "no") << '\n';
     return 0;
+}
+
+int commandHideFilterProbe(int argc, char** argv) {
+#ifdef _WIN32
+    int holdSeconds = 0;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view option = argv[i];
+        if (option == "--hold" && i + 1 < argc) {
+            holdSeconds = std::stoi(argv[++i]);
+            continue;
+        }
+        std::cerr << "Unknown hidefilter-probe option: " << option << '\n'
+                  << "Usage: ApexSenseBridge hidefilter-probe [--hold SECONDS]\n";
+        return 1;
+    }
+    if (holdSeconds < 0 || holdSeconds > 3600) {
+        std::cerr << "--hold must be between 0 and 3600 seconds.\n";
+        return 1;
+    }
+
+    const auto instances = asb::platform::HideFilterIsolation::enumerate();
+    std::size_t reachable = 0;
+    for (const auto& instance : instances) {
+        if (!instance.error.empty()) {
+            std::cerr << instance.error << '\n';
+        }
+        if (instance.interfacePath.empty()) {
+            continue;
+        }
+        ++reachable;
+        std::wcout << L"Filter interface " << reachable << L" is attached to: "
+                   << instance.parentInstanceId;
+        if (!instance.parentService.empty()) {
+            std::wcout << L" (driver: " << instance.parentService << L")";
+        }
+        std::wcout << L'\n';
+    }
+    if (reachable == 0) {
+        std::cout << "No class filter driver is attached to any device on this system.\n"
+                  << "HidHide cannot take this role: it is a HIDClass upper filter that only\n"
+                  << "refuses CreateFile, while XInput never opens a handle. The required driver\n"
+                  << "contract is documented in src/platform/HideFilterIsolation.h.\n";
+        return 2;
+    }
+    std::cout << "Driver reachable. Continuing with the physical controller found below.\n";
+
+    // The physical controller the bridge already knows about is the one to hide, so the
+    // caller does not have to transcribe a device interface by hand.
+    std::string error;
+    const auto candidates = asb::flydigi::Apex5Device::findCandidates(error);
+    if (!error.empty()) {
+        std::cerr << "HID enumeration warning: " << error << '\n';
+    }
+    if (candidates.empty()) {
+        std::cerr << "No APEX/Vader vendor HID interface found; cannot pick a PDO to hide.\n";
+        return 3;
+    }
+
+    const auto countXInput = [] {
+        return asb::platform::connectedXInputGamepads().size();
+    };
+    const auto before = countXInput();
+    std::cout << "XInput gamepads before: " << before << '\n';
+
+    int status = 5;
+    for (const auto& candidate : candidates) {
+        asb::platform::HideFilterIsolation isolation;
+        if (!isolation.activate(candidate, error)) {
+            std::cerr << "Hide request refused: " << error << '\n';
+            continue;
+        }
+        std::wcout << L"Hidden device: " << isolation.hiddenInstanceId() << L'\n';
+        std::cout << "Hide request accepted; waiting for PnP to take effect.\n";
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+        const auto after = countXInput();
+        std::cout << "XInput gamepads after hide: " << after << '\n';
+        std::cout << "Isolation result: "
+                  << (after < before ? "PASS (physical XInput removed)"
+                                     : "FAIL (the filter never saw this PDO)")
+                  << '\n';
+        status = after < before ? 0 : 6;
+
+        if (holdSeconds > 0) {
+            std::cout << "Holding for " << holdSeconds << " second(s) so you can verify in a game.\n";
+            std::this_thread::sleep_for(std::chrono::seconds(holdSeconds));
+        }
+        if (!isolation.restore(error)) {
+            std::cerr << "Restore failed: " << error << '\n';
+            if (status == 0) {
+                status = 7;
+            }
+        }
+        break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::cout << "XInput gamepads after restore: " << countXInput() << '\n';
+    return status;
+#else
+    (void)argc;
+    (void)argv;
+    std::cerr << "hidefilter-probe requires Windows.\n";
+    return 1;
+#endif
 }
 
 int commandClear(int argc, char** argv) {
@@ -1581,7 +1706,9 @@ int commandTestGyro(int argc, char** argv) {
     if (!motionRouting.enable(error)) {
         return fail(7, "Could not enable APEX motion input: " + error);
     }
-    auto input = asb::platform::openPhysicalInputSource(device->info(), std::nullopt, error);
+    auto input = asb::platform::openPhysicalInputSource(
+        device->info(), std::nullopt, error,
+        device->identity().has_value() && device->identity()->isVader5Pro());
     if (!input) {
         return fail(3, "APEX input source unavailable: " + error);
     }

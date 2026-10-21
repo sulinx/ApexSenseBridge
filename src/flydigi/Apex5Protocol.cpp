@@ -137,6 +137,40 @@ Report buildRumble(std::uint8_t lowFrequencyMotor,
     return report;
 }
 
+Report buildVaderIdentityRequest() {
+    // Matches VaderHaptics tools/m1/vader_ds5_bridge/main.cpp SendInfoRequest:
+    //   00 5A A5 01 02 00
+    // Note byte 5 is a literal 0x00, not the Apex-family additive checksum
+    // (which would be 0x03). Measured on Vader 5 Pro firmware 0x7154.
+    Report report{};
+    report[0] = kReportIdOutVader;
+    report[1] = kMagic0;
+    report[2] = kMagic1;
+    report[3] = kCmdGetInfo;
+    report[4] = 0x02;
+    report[5] = 0x00;
+    return report;
+}
+
+Report buildVaderRumble(std::uint8_t leftGrip, std::uint8_t rightGrip,
+                        std::uint8_t leftTrigger, std::uint8_t rightTrigger) {
+    // Mirrors VaderHaptics tools/m3/haptics.cpp BuildVaderHapticPacket:
+    //   00 5A A5 12 06 <Lgrip> <Rgrip> <Ltrigger> <Rtrigger>
+    // The Apex-family length byte (0x06) is kept verbatim; only the report ID
+    // and the two trailing trigger lanes differ.
+    Report report{};
+    report[0] = kReportIdOutVader;
+    report[1] = kMagic0;
+    report[2] = kMagic1;
+    report[3] = kCmdSetRumble;
+    report[4] = 6;
+    report[5] = leftGrip;
+    report[6] = rightGrip;
+    report[7] = leftTrigger;
+    report[8] = rightTrigger;
+    return report;
+}
+
 Report buildReadRgbConfig(std::uint8_t slot, std::uint8_t packetSize) {
     const std::array<std::uint8_t, 2> payload{slot, packetSize};
     return buildChecksummedCommand(kCmdReadRgbConfig, payload);
@@ -205,8 +239,31 @@ Report buildSetInputTransport(bool controllerData, bool rawData) {
     return buildChecksummedCommand(kCmdSetInputTransport, payload);
 }
 
+// LOCAL PATCH: SDL Flydigi V2 acquires with a fixed "SDL" payload and releases
+// with the same frame carrying 0. Verified against VaderHaptics SendAcquire().
+Report buildAcquire(bool acquire) {
+    Report report{};
+    report[0] = kReportIdOutVader;
+    report[1] = kMagic0;
+    report[2] = kMagic1;
+    report[3] = kCmdAcquire;
+    report[4] = 23;
+    report[5] = static_cast<std::uint8_t>(acquire ? 1 : 0);
+    report[6] = 'S';
+    report[7] = 'D';
+    report[8] = 'L';
+    return report;
+}
+
 bool isProfileCommandReply(
     std::span<const std::uint8_t> report, std::uint8_t command) noexcept {
+    // LOCAL PATCH: the Vader 5 Pro answers with report ID 0x00 (it mirrors the
+    // outgoing ID) instead of the Apex 5's 0x04, so accept either lead byte.
+    // Apex-family frames still require 0x04 to keep the old semantics intact.
+    if (report.size() >= 4 && report[0] == kReportIdOutVader &&
+        report[1] == kMagic0 && report[2] == kMagic1 && report[3] == command) {
+        return true;
+    }
     return report.size() >= 4 &&
            report[0] == kReportIdIn &&
            report[1] == kMagic0 &&

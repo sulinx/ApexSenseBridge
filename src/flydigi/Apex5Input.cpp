@@ -83,6 +83,78 @@ decodeApex5InputReport(std::span<const std::uint8_t> report,
     return state;
 }
 
+std::optional<dualsense::DualSenseInputState>
+decodeVaderInputReport(std::span<const std::uint8_t> report,
+                       std::uint8_t batteryPercent,
+                       std::uint8_t chargeState) noexcept {
+    // LOCAL PATCH: Vader 5 Pro operator report (command 0xEF).
+    // VaderHaptics tolerates a stray leading byte, so normalize it first.
+    std::size_t offset = 0;
+    if (report.size() > 1 && report[0] != kMagic0 && report[1] == kMagic0) {
+        offset = 1;
+    }
+    if (report.size() < offset + 18 ||
+        report[offset] != kMagic0 || report[offset + 1] != kMagic1 ||
+        report[offset + 2] != kCmdOperatorData) {
+        return std::nullopt;
+    }
+    const auto at = [&](std::size_t index) -> std::uint8_t {
+        return report[offset + index];
+    };
+
+    platform::XInputSnapshot snapshot{};
+    snapshot.leftX = signedLittleEndian(report, offset + 3);
+    // LOCAL PATCH: do NOT negate Y here.
+    //
+    // This negation was copied from VaderHaptics' DecodeVaderReport, which works
+    // in its own screen-space convention. Downstream, mapXInputState() already
+    // converts a signed XInput axis into the DualSense byte axis with
+    // axisToByte(value, invert = true) for both ly and ry, so negating here as
+    // well inverted the pitch twice and delivered a backward stick. It stayed
+    // invisible for as long as the mapped HID collection was merged over every
+    // vendor frame (mergeApex5MappedControls overwrote both sticks with the
+    // collection's own values); once the vendor frame became the sole source the
+    // left stick read forward/backward reversed in game.
+    //
+    // The Apex 5 branch above (lines ~57-60) never negated, and it feeds the same
+    // mapper, which is the direct evidence that the extra negation is wrong: the
+    // raw Vader report already uses the standard XInput sign for Y.
+    snapshot.leftY = signedLittleEndian(report, offset + 5);
+    snapshot.rightX = signedLittleEndian(report, offset + 7);
+    snapshot.rightY = signedLittleEndian(report, offset + 9);
+    snapshot.leftTrigger = at(15);
+    snapshot.rightTrigger = at(16);
+
+    // Face/vendor buttons are a 16-bit little-endian mask starting at [11].
+    // Bit assignments match VaderHaptics NormalizeMi01State().
+    const auto face = static_cast<std::uint16_t>(
+        at(11) | (static_cast<std::uint16_t>(at(12)) << 8U));
+    if (face & 0x0010) snapshot.buttons |= platform::xinputButton::kA;
+    if (face & 0x0020) snapshot.buttons |= platform::xinputButton::kB;
+    if (face & 0x0040) snapshot.buttons |= platform::xinputButton::kBack;
+    if (face & 0x0080) snapshot.buttons |= platform::xinputButton::kX;
+    if (face & 0x0100) snapshot.buttons |= platform::xinputButton::kY;
+    if (face & 0x0200) snapshot.buttons |= platform::xinputButton::kStart;
+    if (face & 0x0400) snapshot.buttons |= platform::xinputButton::kLeftShoulder;
+    if (face & 0x0800) snapshot.buttons |= platform::xinputButton::kRightShoulder;
+    if (face & 0x4000) snapshot.buttons |= platform::xinputButton::kLeftThumb;
+    if (face & 0x8000) snapshot.buttons |= platform::xinputButton::kRightThumb;
+
+    // Raw hat is a four-direction bitmask, not an angle (dpad_map.h).
+    const auto hat = static_cast<std::uint8_t>(at(11) & 0x0F);
+    if (hat & 0x01) snapshot.buttons |= platform::xinputButton::kDpadUp;
+    if (hat & 0x04) snapshot.buttons |= platform::xinputButton::kDpadDown;
+    if (hat & 0x08) snapshot.buttons |= platform::xinputButton::kDpadLeft;
+    if (hat & 0x02) snapshot.buttons |= platform::xinputButton::kDpadRight;
+
+    auto state = platform::mapXInputState(snapshot);
+    state.batteryPercent = batteryPercent;
+    state.chargeState = chargeState;
+    // The Vader operator report carries no IMU; leave gyro/accel at zero rather
+    // than inventing motion data.
+    return state;
+}
+
 void mergeApex5MappedControls(
     dualsense::DualSenseInputState& vendorState,
     const dualsense::DualSenseInputState& mappedState) noexcept {
